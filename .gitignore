@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+env/
+.env
+
+# Node
+node_modules/
+.next/
+out/
+
+# VSCode
+.vscode/*
+!.vscode/settings.json
+
+# Données / uploads
+backend/uploads/*
+!backend/uploads/.gitkeep
+ai/dataset/*
+!ai/dataset/.gitkeep
+ai/models/*
+!ai/models/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
