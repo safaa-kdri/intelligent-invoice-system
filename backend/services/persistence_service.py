@@ -176,3 +176,86 @@ def get_anomalies_by_facture_id(facture_id: int) -> list[dict]:
     finally:
         cursor.close()
         conn.close()
+
+def get_all_factures(
+    page: int = 1,
+    limit: int = 20,
+    status: str | None = None,
+    label: str | None = None,
+) -> tuple[list[dict], int]:
+    """
+    Récupère la liste paginée des factures, avec filtres optionnels.
+    Retourne (liste_factures, total_count).
+    """
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        # Construire la clause WHERE dynamiquement
+        where_clauses = []
+        params = []
+
+        if status:
+            where_clauses.append("statut = %s")
+            params.append(status)
+        if label:
+            where_clauses.append("type_document = %s")
+            params.append(label)
+
+        where_sql = ""
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+        # Compter le total
+        cursor.execute(f"SELECT COUNT(*) AS total FROM facture {where_sql};", params)
+        total = cursor.fetchone()["total"]
+
+        # Récupérer la page
+        offset = (page - 1) * limit
+        cursor.execute(
+            f"SELECT id, nom_fichier, type_document, statut, date_importation "
+            f"FROM facture {where_sql} "
+            f"ORDER BY date_importation DESC "
+            f"LIMIT %s OFFSET %s;",
+            params + [limit, offset],
+        )
+        rows = cursor.fetchall()
+
+        # Convertir les datetime en string ISO
+        for row in rows:
+            if row.get("date_importation"):
+                row["date_importation"] = row["date_importation"].isoformat()
+
+        return rows, total
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def delete_facture(facture_id: int) -> bool:
+    """
+    Supprime une facture (et ses données associées par CASCADE).
+    Retourne True si une ligne a été supprimée, False sinon.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM facture WHERE id = %s;", (facture_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def facture_exists(facture_id: int) -> bool:
+    """
+    Vérifie si une facture existe.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT COUNT(*) FROM facture WHERE id = %s;", (facture_id,))
+        return cursor.fetchone()[0] > 0
+    finally:
+        cursor.close()
+        conn.close()

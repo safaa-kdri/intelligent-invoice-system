@@ -86,3 +86,64 @@ export async function checkHealth(): Promise<{ status: string }> {
   const response = await api.get("/api/health");
   return response.data;
 }
+
+// ==================== TYPES ====================
+
+export interface InvoiceListItem {
+  id: number;
+  nom_fichier: string;
+  type_document: string | null;
+  statut: "processed" | "warning" | "failed" | "pending";
+  date_importation: string;
+}
+
+export interface InvoiceListResponse {
+  total: number;
+  page: number;
+  limit: number;
+  invoices: InvoiceListItem[];
+}
+
+export interface GetInvoicesParams {
+  page?: number;
+  limit?: number;
+  status?: "processed" | "warning" | "failed";
+  label?: "facture_achat" | "facture_vente" | "autre";
+}
+
+// ==================== FONCTIONS ====================
+
+/**
+ * Récupère la liste paginée des factures.
+ */
+export async function getInvoices(
+  params: GetInvoicesParams = {}
+): Promise<InvoiceListResponse> {
+  const response = await api.get<InvoiceListResponse>("/api/invoices", {
+    params,
+  });
+  return response.data;
+}
+
+/**
+ * Récupère le détail d'une facture par son ID.
+ */
+export async function getInvoiceById(id: number): Promise<InvoiceResponse> {
+  const response = await api.get<InvoiceResponse>(`/api/invoices/${id}`);
+  return response.data;
+}
+
+/**
+ * Supprime une facture.
+ */
+export async function deleteInvoice(id: number): Promise<{ id: number; status: string }> {
+  const response = await api.delete(`/api/invoices/${id}`);
+  return response.data;
+}
+
+/**
+ * Ouvre le téléchargement du JSON d'une facture dans un nouvel onglet.
+ */
+export function downloadInvoice(id: number): void {
+  window.open(`${API_BASE_URL}/api/invoices/${id}/export`, "_blank");
+}

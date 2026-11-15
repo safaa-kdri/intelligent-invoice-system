@@ -205,3 +205,178 @@ def upload():
                 "details": str(e),
             }
         }), 500
+
+
+# ==================================================
+# GET /api/invoices — liste paginée
+# ==================================================
+@invoices_bp.route("", methods=["GET"])
+def list_invoices():
+    """
+    Retourne la liste paginée des factures.
+    Query params :
+        - page (int, défaut 1)
+        - limit (int, défaut 20, max 100)
+        - status (processed | warning | failed)
+        - label (facture_achat | facture_vente | autre)
+    """
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+        limit = min(100, max(1, int(request.args.get("limit", 20))))
+    except ValueError:
+        return jsonify({
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": "Les paramètres 'page' et 'limit' doivent être des entiers."
+            }
+        }), 400
+
+    status = request.args.get("status")
+    label = request.args.get("label")
+
+    invoices, total = persistence_service.get_all_factures(
+        page=page, limit=limit, status=status, label=label
+    )
+
+    return jsonify({
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "invoices": invoices,
+    }), 200
+
+
+# ==================================================
+# GET /api/invoices/<id> — détail d'une facture
+# ==================================================
+@invoices_bp.route("/<int:facture_id>", methods=["GET"])
+def get_invoice(facture_id: int):
+    """
+    Retourne le détail complet d'une facture (facture + analyse + extrait).
+    """
+    row = persistence_service.get_facture_by_id(facture_id)
+    if row is None:
+        return jsonify({
+            "error": {
+                "code": "NOT_FOUND",
+                "message": f"Aucune facture trouvée avec l'identifiant {facture_id}."
+            }
+        }), 404
+
+    anomalies = persistence_service.get_anomalies_by_facture_id(facture_id)
+
+    # Construire la réponse conforme au contrat d'API
+    return jsonify({
+        "id": row["id"],
+        "filename": row["nom_fichier"],
+        "status": row["statut"],
+        "classification": {
+            "label": row["type_document"] or "autre",
+            "confidence": row["confiance"] or 0.0,
+        },
+        "quality": {
+            "is_blurry": any(a["type_anomalie"] == "BLURRY_IMAGE" for a in anomalies),
+            "is_dark": any(a["type_anomalie"] == "DARK_IMAGE" for a in anomalies),
+            "is_skewed": any(a["type_anomalie"] == "SKEWED_IMAGE" for a in anomalies),
+            "is_badly_framed": any(a["type_anomalie"] == "BAD_FRAMING" for a in anomalies),
+            "quality_status": row["qualite"] or "good",
+            "scores": {
+                "blur_variance": 0.0,
+                "brightness_mean": 0.0,
+                "skew_angle": 0.0,
+            },
+        },
+        "extracted": {
+            "supplier": row["fournisseur"],
+            "invoice_number": row["numero_facture"],
+            "date": row["date_facture"].isoformat() if row["date_facture"] else None,
+            "total_ht": float(row["montant_ht"]) if row["montant_ht"] is not None else None,
+            "vat": float(row["montant_tva"]) if row["montant_tva"] is not None else None,
+            "total_ttc": float(row["montant_ttc"]) if row["montant_ttc"] is not None else None,
+        },
+        "validation": {
+            "is_valid": len(anomalies) == 0,
+            "warnings": [a["type_anomalie"] for a in anomalies],
+        },
+        "ocr_text": row["texte_ocr"] or "",
+        "created_at": row["date_importation"].isoformat() if row["date_importation"] else None,
+    }), 200
+
+
+# ==================================================
+# DELETE /api/invoices/<id> — supprimer une facture
+# ==================================================
+@invoices_bp.route("/<int:facture_id>", methods=["DELETE"])
+def delete_invoice(facture_id: int):
+    """
+    Supprime une facture et toutes ses données associées (CASCADE).
+    """
+    if not persistence_service.facture_exists(facture_id):
+        return jsonify({
+            "error": {
+                "code": "NOT_FOUND",
+                "message": f"Aucune facture trouvée avec l'identifiant {facture_id}."
+            }
+        }), 404
+
+    # Supprimer le fichier physique
+    row = persistence_service.get_facture_by_id(facture_id)
+    if row and row.get("chemin_fichier"):
+        try:
+            if os.path.exists(row["chemin_fichier"]):
+                os.remove(row["chemin_fichier"])
+        except Exception:
+            pass  # on ignore si le fichier ne peut pas être supprimé
+
+    # Supprimer en base (CASCADE supprime les tables liées)
+    persistence_service.delete_facture(facture_id)
+
+    return jsonify({"id": facture_id, "status": "deleted"}), 200
+
+
+# ==================================================
+# GET /api/invoices/<id>/export — téléchargement JSON
+# ==================================================
+@invoices_bp.route("/<int:facture_id>/export", methods=["GET"])
+def export_invoice(facture_id: int):
+    """
+    Retourne le détail d'une facture en JSON téléchargeable.
+    """
+    row = persistence_service.get_facture_by_id(facture_id)
+    if row is None:
+        return jsonify({
+            "error": {
+                "code": "NOT_FOUND",
+                "message": f"Aucune facture trouvée avec l'identifiant {facture_id}."
+            }
+        }), 404
+
+    anomalies = persistence_service.get_anomalies_by_facture_id(facture_id)
+
+    data = {
+        "id": row["id"],
+        "filename": row["nom_fichier"],
+        "status": row["statut"],
+        "classification": {
+            "label": row["type_document"] or "autre",
+            "confidence": row["confiance"] or 0.0,
+        },
+        "extracted": {
+            "supplier": row["fournisseur"],
+            "invoice_number": row["numero_facture"],
+            "date": row["date_facture"].isoformat() if row["date_facture"] else None,
+            "total_ht": float(row["montant_ht"]) if row["montant_ht"] is not None else None,
+            "vat": float(row["montant_tva"]) if row["montant_tva"] is not None else None,
+            "total_ttc": float(row["montant_ttc"]) if row["montant_ttc"] is not None else None,
+        },
+        "validation": {
+            "is_valid": len(anomalies) == 0,
+            "warnings": [a["type_anomalie"] for a in anomalies],
+        },
+        "ocr_text": row["texte_ocr"] or "",
+        "created_at": row["date_importation"].isoformat() if row["date_importation"] else None,
+    }
+
+    response = jsonify(data)
+    response.headers["Content-Disposition"] = f'attachment; filename="facture_{facture_id}.json"'
+    return response, 200
