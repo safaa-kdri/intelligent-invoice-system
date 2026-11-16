@@ -9,23 +9,22 @@ from werkzeug.utils import secure_filename
 
 from services import persistence_service
 from services.quality_service import analyze_quality
+from services.classification_service import predict as classify_image
 
 
-# Création du blueprint
 invoices_bp = Blueprint("invoices", __name__)
 
 
-# Constantes de configuration
 UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads")
 ALLOWED_EXTENSIONS = {"pdf", "jpg", "jpeg", "png"}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 Mo
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
 
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
 def allowed_file(filename: str) -> bool:
-    """Vérifie que l'extension du fichier est autorisée."""
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
@@ -34,10 +33,7 @@ def allowed_file(filename: str) -> bool:
 # ==================================================
 @invoices_bp.route("/upload", methods=["POST"])
 def upload():
-    """
-    Reçoit un fichier, le valide, le sauvegarde, analyse sa qualité,
-    l'enregistre dans MySQL et retourne un JSON structuré.
-    """
+    """Upload + contrôle qualité + classification CNN + insertion MySQL."""
     # ===== 1. Vérifier la présence d'un fichier =====
     if "file" not in request.files:
         return jsonify({
@@ -48,7 +44,6 @@ def upload():
         }), 400
 
     f = request.files["file"]
-
     if f.filename == "":
         return jsonify({
             "error": {
@@ -67,7 +62,7 @@ def upload():
             }
         }), 415
 
-    # ===== 3. Vérifier la taille et la vacuité =====
+    # ===== 3. Vérifier la taille =====
     content = f.read()
     f.seek(0)
 
@@ -88,58 +83,76 @@ def upload():
             }
         }), 400
 
-    # ===== 4. Sauvegarder avec un nom unique =====
+    # ===== 4. Sauvegarder =====
     original_name = secure_filename(f.filename)
     ext = original_name.rsplit(".", 1)[1].lower() if "." in original_name else ""
     unique_name = f"{uuid.uuid4().hex}.{ext}"
     save_path = os.path.join(UPLOAD_FOLDER, unique_name)
     f.save(save_path)
 
-    # ===== 5. Analyse qualité avec OpenCV =====
+    # ===== 5. Analyse qualité (OpenCV) =====
     quality_result = None
     quality_error = None
 
-    if ext in {"jpg", "jpeg", "png"}:
+    if ext in IMAGE_EXTENSIONS:
         try:
             quality_result = analyze_quality(save_path)
         except Exception as e:
             quality_error = str(e)
     else:
-        # PDF : OpenCV ne lit pas les PDF → résultat neutre
         quality_result = {
-            "is_blurry": False,
-            "is_dark": False,
-            "is_skewed": False,
-            "is_badly_framed": False,
+            "is_blurry": False, "is_dark": False,
+            "is_skewed": False, "is_badly_framed": False,
             "quality_status": "good",
             "scores": {
-                "blur_variance": 0.0,
-                "brightness_mean": 0.0,
-                "skew_angle": 0.0,
-                "document_area_ratio": 0.0,
+                "blur_variance": 0.0, "brightness_mean": 0.0,
+                "skew_angle": 0.0, "document_area_ratio": 0.0,
             },
             "issues": ["PDF_QUALITY_NOT_ANALYZED"],
         }
 
-    # ===== 6. Insérer dans MySQL =====
+    # ===== 6. Classification CNN (NOUVEAU) =====
+    classification_label = None
+    classification_confidence = 0.0
+    classification_error = None
+
+    if ext in IMAGE_EXTENSIONS:
+        try:
+            label, conf = classify_image(save_path)
+            classification_label = label
+            classification_confidence = conf
+        except Exception as e:
+            classification_error = str(e)
+    else:
+        # PDF : le CNN ne lit pas les PDF directement
+        classification_label = None
+        classification_error = "PDF_CLASSIFICATION_NOT_SUPPORTED"
+
+    # ===== 7. Construire les warnings =====
+    warnings = []
+    if quality_result:
+        warnings.extend(quality_result.get("issues", []))
+    if quality_error:
+        warnings.append(f"QUALITY_ANALYSIS_FAILED: {quality_error}")
+    if classification_error:
+        warnings.append(f"CLASSIFICATION_FAILED: {classification_error}")
+
+    # Warnings spécifiques à la classification
+    if classification_label is not None:
+        if classification_confidence < 0.6:
+            warnings.append("LOW_CONFIDENCE")
+
+    # Tant que l'OCR n'est pas branché, on ajoute ce warning
+    warnings.append("OCR_NOT_CONNECTED")
+
+    # ===== 8. Insérer dans MySQL =====
     try:
         facture_id = persistence_service.create_facture(
             nom_fichier=unique_name,
             chemin_fichier=save_path,
         )
 
-        classification_label = None
-        classification_confidence = 0.0
         ocr_text = ""
-
-        # Warnings depuis l'analyse qualité
-        warnings = []
-        if quality_result:
-            warnings.extend(quality_result.get("issues", []))
-        warnings.append("PIPELINE_IA_NOT_CONNECTED")
-
-        if quality_error:
-            warnings.append(f"QUALITY_ANALYSIS_FAILED: {quality_error}")
 
         persistence_service.create_resultat_analyse(
             facture_id=facture_id,
@@ -187,18 +200,12 @@ def upload():
                 "is_badly_framed": quality_result["is_badly_framed"] if quality_result else False,
                 "quality_status": quality_result["quality_status"] if quality_result else "unknown",
                 "scores": quality_result["scores"] if quality_result else {
-                    "blur_variance": 0.0,
-                    "brightness_mean": 0.0,
-                    "skew_angle": 0.0,
+                    "blur_variance": 0.0, "brightness_mean": 0.0, "skew_angle": 0.0,
                 },
             },
             "extracted": {
-                "supplier": None,
-                "invoice_number": None,
-                "date": None,
-                "total_ht": None,
-                "vat": None,
-                "total_ttc": None,
+                "supplier": None, "invoice_number": None, "date": None,
+                "total_ht": None, "vat": None, "total_ttc": None,
             },
             "validation": {
                 "is_valid": len(warnings) == 0,
@@ -218,18 +225,17 @@ def upload():
         return jsonify({
             "error": {
                 "code": "DB_ERROR",
-                "message": "Impossible d'enregistrer la facture en base de données.",
+                "message": "Impossible d'enregistrer la facture.",
                 "details": str(e),
             }
         }), 500
 
 
 # ==================================================
-# GET /api/invoices — liste paginée
+# GET /api/invoices — liste
 # ==================================================
 @invoices_bp.route("", methods=["GET"])
 def list_invoices():
-    """Retourne la liste paginée des factures."""
     try:
         page = max(1, int(request.args.get("page", 1)))
         limit = min(100, max(1, int(request.args.get("limit", 20))))
@@ -249,19 +255,15 @@ def list_invoices():
     )
 
     return jsonify({
-        "total": total,
-        "page": page,
-        "limit": limit,
-        "invoices": invoices,
+        "total": total, "page": page, "limit": limit, "invoices": invoices,
     }), 200
 
 
 # ==================================================
-# GET /api/invoices/<id> — détail d'une facture
+# GET /api/invoices/<id>
 # ==================================================
 @invoices_bp.route("/<int:facture_id>", methods=["GET"])
 def get_invoice(facture_id: int):
-    """Retourne le détail complet d'une facture."""
     row = persistence_service.get_facture_by_id(facture_id)
     if row is None:
         return jsonify({
@@ -287,11 +289,7 @@ def get_invoice(facture_id: int):
             "is_skewed": any(a["type_anomalie"] == "SKEWED_IMAGE" for a in anomalies),
             "is_badly_framed": any(a["type_anomalie"] == "BAD_FRAMING" for a in anomalies),
             "quality_status": row["qualite"] or "good",
-            "scores": {
-                "blur_variance": 0.0,
-                "brightness_mean": 0.0,
-                "skew_angle": 0.0,
-            },
+            "scores": {"blur_variance": 0.0, "brightness_mean": 0.0, "skew_angle": 0.0},
         },
         "extracted": {
             "supplier": row["fournisseur"],
@@ -311,11 +309,10 @@ def get_invoice(facture_id: int):
 
 
 # ==================================================
-# DELETE /api/invoices/<id> — supprimer une facture
+# DELETE /api/invoices/<id>
 # ==================================================
 @invoices_bp.route("/<int:facture_id>", methods=["DELETE"])
 def delete_invoice(facture_id: int):
-    """Supprime une facture et toutes ses données associées (CASCADE)."""
     if not persistence_service.facture_exists(facture_id):
         return jsonify({
             "error": {
@@ -333,16 +330,14 @@ def delete_invoice(facture_id: int):
             pass
 
     persistence_service.delete_facture(facture_id)
-
     return jsonify({"id": facture_id, "status": "deleted"}), 200
 
 
 # ==================================================
-# GET /api/invoices/<id>/export — téléchargement JSON
+# GET /api/invoices/<id>/export
 # ==================================================
 @invoices_bp.route("/<int:facture_id>/export", methods=["GET"])
 def export_invoice(facture_id: int):
-    """Retourne le détail d'une facture en JSON téléchargeable."""
     row = persistence_service.get_facture_by_id(facture_id)
     if row is None:
         return jsonify({
