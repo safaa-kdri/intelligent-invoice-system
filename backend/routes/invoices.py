@@ -7,7 +7,7 @@ Pipeline complet :
     2. Contrôle qualité (OpenCV)
     3. Classification (MobileNetV2)
     4. Extraction OCR (EasyOCR)
-    5. Validation cohérence
+    5. Raffinement métier (business_logic) ← NOUVEAU
     6. Insertion MySQL
     7. Réponse JSON
 """
@@ -20,6 +20,7 @@ from services import persistence_service
 from services.quality_service import analyze_quality
 from services.classification_service import predict as classify_image
 from services.ocr_service import extract_fields as extract_ocr_fields
+from services.business_logic_service import refine_classification
 
 
 invoices_bp = Blueprint("invoices", __name__)
@@ -29,8 +30,6 @@ UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.dirname(__file__)), "upload
 ALLOWED_EXTENSIONS = {"pdf", "jpg", "jpeg", "png"}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 Mo
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
-
-# Tolérance pour la vérification HT + TVA = TTC
 AMOUNT_TOLERANCE = 0.01
 
 
@@ -46,7 +45,10 @@ def allowed_file(filename: str) -> bool:
 # ==================================================
 @invoices_bp.route("/upload", methods=["POST"])
 def upload():
-    """Upload + pipeline complet (OpenCV + CNN + EasyOCR + MySQL)."""
+    """
+    Upload + pipeline complet :
+    OpenCV → CNN → EasyOCR → Logique métier → MySQL
+    """
 
     # ===== 1. Vérifier la présence d'un fichier =====
     if "file" not in request.files:
@@ -114,7 +116,6 @@ def upload():
         except Exception as e:
             quality_error = str(e)
     else:
-        # PDF : OpenCV ne lit pas directement les PDF
         quality_result = {
             "is_blurry": False, "is_dark": False,
             "is_skewed": False, "is_badly_framed": False,
@@ -127,15 +128,13 @@ def upload():
         }
 
     # ===== 6. Classification CNN =====
-    classification_label = None
-    classification_confidence = 0.0
+    cnn_label = None
+    cnn_confidence = 0.0
     classification_error = None
 
     if ext in IMAGE_EXTENSIONS:
         try:
-            label, conf = classify_image(save_path)
-            classification_label = label
-            classification_confidence = conf
+            cnn_label, cnn_confidence = classify_image(save_path)
         except Exception as e:
             classification_error = str(e)
     else:
@@ -151,7 +150,15 @@ def upload():
         except Exception as e:
             ocr_error = str(e)
 
-    # ===== 8. Construire les warnings =====
+    # ===== 8. Raffinement métier (NOUVEAU) =====
+    refined = refine_classification(
+        cnn_label=cnn_label or "autre",
+        cnn_confidence=cnn_confidence,
+        ocr_result=ocr_result,
+    )
+    final_label = refined["final_label"]
+
+    # ===== 9. Construire les warnings =====
     warnings = []
 
     # Qualité
@@ -163,10 +170,20 @@ def upload():
     # Classification
     if classification_error:
         warnings.append(f"CLASSIFICATION_FAILED:{classification_error}")
-    if classification_label is not None and classification_confidence < 0.6:
+    if cnn_label is not None and cnn_confidence < 0.6:
         warnings.append("LOW_CONFIDENCE")
 
-    # OCR
+    # Si l'OCR a corrigé le CNN → warning explicite
+    if refined["corrected"]:
+        warnings.append("CNN_OVERRIDDEN_BY_OCR")
+
+    # Si indéterminé → warning
+    if refined["ocr_hint"]["hint"] == "indetermine" and cnn_label in (
+        "facture_achat", "facture_vente"
+    ):
+        warnings.append("INVOICE_TYPE_UNDETERMINED")
+
+    # OCR : champs manquants
     if ocr_error:
         warnings.append(f"OCR_FAILED:{ocr_error}")
     if ocr_result:
@@ -174,7 +191,7 @@ def upload():
             if ocr_result.get(field) is None:
                 warnings.append(f"MISSING_FIELD:{field}")
 
-        # Vérifier cohérence HT + TVA = TTC
+        # Cohérence HT + TVA = TTC
         ht = ocr_result.get("total_ht")
         vat = ocr_result.get("vat")
         ttc = ocr_result.get("total_ttc")
@@ -182,22 +199,20 @@ def upload():
             if abs((ht + vat) - ttc) > AMOUNT_TOLERANCE:
                 warnings.append("AMOUNT_MISMATCH")
 
-    # ===== 9. Insérer dans MySQL =====
+    # ===== 10. Insérer dans MySQL =====
     try:
         facture_id = persistence_service.create_facture(
             nom_fichier=unique_name,
             chemin_fichier=save_path,
         )
 
-        # Résultat d'analyse
         persistence_service.create_resultat_analyse(
             facture_id=facture_id,
-            confiance=classification_confidence,
+            confiance=cnn_confidence,
             qualite=quality_result["quality_status"] if quality_result else "unknown",
             texte_ocr=ocr_result.get("raw_text", "") if ocr_result else "",
         )
 
-        # Anomalies / warnings
         for warning in warnings:
             persistence_service.create_anomalie(
                 facture_id=facture_id,
@@ -205,7 +220,6 @@ def upload():
                 description="Avertissement détecté lors du traitement.",
             )
 
-        # Données extraites par OCR
         persistence_service.create_donnee_extraite(
             facture_id=facture_id,
             fournisseur=ocr_result.get("supplier") if ocr_result else None,
@@ -216,15 +230,13 @@ def upload():
             montant_ttc=ocr_result.get("total_ttc") if ocr_result else None,
         )
 
-        # Statut final
         final_status = "warning" if warnings else "processed"
         persistence_service.update_facture_status(
             facture_id=facture_id,
-            type_document=classification_label or "autre",
+            type_document=final_label,
             statut=final_status,
         )
 
-        # Récupérer la date d'insertion
         facture_row = persistence_service.get_facture_by_id(facture_id)
         created_at = (
             facture_row["date_importation"].isoformat()
@@ -232,14 +244,22 @@ def upload():
             else None
         )
 
-        # ===== 10. Construire la réponse JSON =====
+        # ===== 11. Réponse JSON =====
         return jsonify({
             "id": facture_id,
             "filename": unique_name,
             "status": final_status,
             "classification": {
-                "label": classification_label or "autre",
-                "confidence": classification_confidence,
+                "label": final_label,
+                "confidence": cnn_confidence,
+                "cnn_label": cnn_label,
+                "corrected": refined["corrected"],
+                "correction_reason": refined["reason"] if refined["corrected"] else None,
+                "ocr_hint": refined["ocr_hint"]["hint"],
+                "ocr_matches": {
+                    "achat": refined["ocr_hint"]["achat_matches"][:3],
+                    "vente": refined["ocr_hint"]["vente_matches"][:3],
+                },
             },
             "quality": {
                 "is_blurry": quality_result["is_blurry"] if quality_result else False,
@@ -268,7 +288,6 @@ def upload():
         }), 200
 
     except Exception as e:
-        # Rollback : supprimer le fichier si l'insertion échoue
         try:
             if os.path.exists(save_path):
                 os.remove(save_path)

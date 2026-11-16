@@ -24,6 +24,7 @@ import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import WarningIcon from "@mui/icons-material/Warning";
 import ErrorIcon from "@mui/icons-material/Error";
 import DescriptionIcon from "@mui/icons-material/Description";
+import SyncIcon from "@mui/icons-material/Sync";
 import {
   uploadInvoice,
   InvoiceResponse,
@@ -45,12 +46,17 @@ const WARNING_FR: Record<string, string> = {
   PIPELINE_IA_NOT_CONNECTED: "Pipeline IA pas encore connecté",
   BLURRY_IMAGE: "Image floue",
   DARK_IMAGE: "Image trop sombre",
+  OVEREXPOSED_IMAGE: "Image surexposée",
   SKEWED_IMAGE: "Image inclinée",
   BAD_FRAMING: "Cadrage incorrect",
   AMOUNT_MISMATCH: "HT + TVA ≠ TTC",
   INVALID_DATE: "Date invalide",
   POTENTIAL_DUPLICATE: "Doublon potentiel",
   LOW_CONFIDENCE: "Confiance faible",
+  CNN_OVERRIDDEN_BY_OCR: "Corrigé par l'analyse OCR",
+  INVOICE_TYPE_UNDETERMINED: "Type achat/vente indéterminé",
+  PDF_QUALITY_NOT_ANALYZED: "Qualité PDF non analysée",
+  PDF_CLASSIFICATION_NOT_SUPPORTED: "Classification PDF non supportée",
 };
 
 export default function InvoiceUploader() {
@@ -106,7 +112,6 @@ export default function InvoiceUploader() {
     setResult(null);
     setProgress(0);
 
-    // Fausse barre de progression (le vrai upload est rapide, c'est l'IA qui prend du temps)
     const progressInterval = setInterval(() => {
       setProgress((prev) => Math.min(prev + 10, 90));
     }, 300);
@@ -183,6 +188,122 @@ export default function InvoiceUploader() {
     );
   };
 
+  // ===== RENDU DE LA SECTION CLASSIFICATION =====
+  const renderClassification = (r: InvoiceResponse) => {
+    const c = r.classification;
+    return (
+      <Box sx={{ mb: 2 }}>
+        {/* Ligne principale : label + confiance */}
+        <Stack
+          direction="row"
+          spacing={2}
+          sx={{ alignItems: "center", mb: 1 }}
+        >
+          <Chip
+            label={LABEL_FR[c.label] || c.label}
+            color="primary"
+            size="medium"
+          />
+          <Typography variant="body2" color="text.secondary">
+            Confiance : {(c.confidence * 100).toFixed(1)}%
+          </Typography>
+        </Stack>
+
+        {/* Correction automatique */}
+        {c.corrected && (
+          <Alert
+            severity="info"
+            icon={<SyncIcon />}
+            sx={{ mt: 1, py: 0.5 }}
+          >
+            <Typography variant="caption" component="div">
+              <strong>Correction automatique :</strong> le CNN avait prédit{" "}
+              <strong>
+                {LABEL_FR[c.cnn_label || ""] || c.cnn_label || "—"}
+              </strong>
+              , mais l&apos;analyse OCR a détecté des indices de{" "}
+              <strong>{c.ocr_hint}</strong>.
+            </Typography>
+            {c.correction_reason && (
+              <Typography
+                variant="caption"
+                color="text.secondary"
+                component="div"
+                sx={{ mt: 0.5, fontStyle: "italic" }}
+              >
+                {c.correction_reason}
+              </Typography>
+            )}
+            {/* Mots-clés détectés */}
+            {c.ocr_matches &&
+              ((c.ocr_matches.achat && c.ocr_matches.achat.length > 0) ||
+                (c.ocr_matches.vente && c.ocr_matches.vente.length > 0)) && (
+                <Box sx={{ mt: 0.5 }}>
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    component="div"
+                  >
+                    Indices détectés :
+                  </Typography>
+                  <Stack
+                    direction="row"
+                    spacing={0.5}
+                    sx={{ flexWrap: "wrap", mt: 0.5 }}
+                    useFlexGap
+                  >
+                    {c.ocr_matches.achat?.map((m, i) => (
+                      <Chip
+                        key={`achat-${i}`}
+                        label={`📥 ${m}`}
+                        size="small"
+                        color="success"
+                        variant="outlined"
+                      />
+                    ))}
+                    {c.ocr_matches.vente?.map((m, i) => (
+                      <Chip
+                        key={`vente-${i}`}
+                        label={`📤 ${m}`}
+                        size="small"
+                        color="info"
+                        variant="outlined"
+                      />
+                    ))}
+                  </Stack>
+                </Box>
+              )}
+          </Alert>
+        )}
+
+        {/* Cohérence CNN + OCR (si pas de correction) */}
+        {!c.corrected &&
+          c.ocr_hint &&
+          c.ocr_hint !== "indetermine" &&
+          c.label !== "autre" && (
+            <Typography
+              variant="caption"
+              color="success.main"
+              sx={{ display: "block", mt: 0.5 }}
+            >
+              ✓ Cohérence CNN + OCR : <strong>{c.ocr_hint}</strong>
+            </Typography>
+          )}
+
+        {/* Indéterminé */}
+        {c.ocr_hint === "indetermine" && c.label !== "autre" && (
+          <Typography
+            variant="caption"
+            color="warning.main"
+            sx={{ display: "block", mt: 0.5 }}
+          >
+            ⚠️ Type achat/vente indéterminé — aucun indice textuel détecté
+          </Typography>
+        )}
+      </Box>
+    );
+  };
+
   return (
     <Box>
       {/* ===== ZONE D'UPLOAD ===== */}
@@ -232,7 +353,6 @@ export default function InvoiceUploader() {
             )}
           </Box>
 
-          {/* ✅ CORRECTION 1 : justifyContent déplacé dans sx */}
           <Stack
             direction="row"
             spacing={2}
@@ -287,7 +407,6 @@ export default function InvoiceUploader() {
       {result && (
         <Card>
           <CardContent>
-            {/* ✅ CORRECTION 2 : justifyContent + alignItems + mb dans sx */}
             <Stack
               direction="row"
               sx={{
@@ -302,7 +421,7 @@ export default function InvoiceUploader() {
 
             <Divider sx={{ mb: 2 }} />
 
-            {/* Classification */}
+            {/* Classification (avec logique métier) */}
             <Typography
               variant="subtitle1"
               sx={{ fontWeight: "bold", color: "secondary.main" }}
@@ -310,25 +429,7 @@ export default function InvoiceUploader() {
             >
               Classification
             </Typography>
-
-            {/* ✅ CORRECTION 3 : alignItems + mb dans sx */}
-            <Stack
-              direction="row"
-              spacing={2}
-              sx={{ alignItems: "center", mb: 2 }}
-            >
-              <Chip
-                label={
-                  LABEL_FR[result.classification.label] ||
-                  result.classification.label
-                }
-                color="primary"
-                size="medium"
-              />
-              <Typography variant="body2" color="text.secondary">
-                Confiance : {(result.classification.confidence * 100).toFixed(1)}%
-              </Typography>
-            </Stack>
+            {renderClassification(result)}
 
             {/* Qualité */}
             <Typography
@@ -409,7 +510,12 @@ export default function InvoiceUploader() {
                 >
                   Avertissements
                 </Typography>
-                <Stack direction="row" spacing={1} sx={{ flexWrap: "wrap" }} useFlexGap>
+                <Stack
+                  direction="row"
+                  spacing={1}
+                  sx={{ flexWrap: "wrap" }}
+                  useFlexGap
+                >
                   {result.validation.warnings.map((w) => (
                     <Chip
                       key={w}

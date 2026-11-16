@@ -14,6 +14,14 @@ export const api = axios.create({
 export interface ClassificationResult {
   label: "facture_achat" | "facture_vente" | "autre";
   confidence: number;
+  cnn_label?: "facture_achat" | "facture_vente" | "autre" | null;
+  corrected?: boolean;
+  correction_reason?: string | null;
+  ocr_hint?: "achat" | "vente" | "indetermine";
+  ocr_matches?: {
+    achat: string[];
+    vente: string[];
+  };
 }
 
 export interface QualityResult {
