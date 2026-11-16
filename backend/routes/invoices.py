@@ -1,6 +1,15 @@
 """
 Routes pour la gestion des factures.
 Blueprint Flask monté sur /api/invoices
+
+Pipeline complet :
+    1. Upload + validation fichier
+    2. Contrôle qualité (OpenCV)
+    3. Classification (MobileNetV2)
+    4. Extraction OCR (EasyOCR)
+    5. Validation cohérence
+    6. Insertion MySQL
+    7. Réponse JSON
 """
 import os
 import uuid
@@ -10,6 +19,7 @@ from werkzeug.utils import secure_filename
 from services import persistence_service
 from services.quality_service import analyze_quality
 from services.classification_service import predict as classify_image
+from services.ocr_service import extract_fields as extract_ocr_fields
 
 
 invoices_bp = Blueprint("invoices", __name__)
@@ -19,6 +29,9 @@ UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.dirname(__file__)), "upload
 ALLOWED_EXTENSIONS = {"pdf", "jpg", "jpeg", "png"}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 Mo
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
+
+# Tolérance pour la vérification HT + TVA = TTC
+AMOUNT_TOLERANCE = 0.01
 
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -33,7 +46,8 @@ def allowed_file(filename: str) -> bool:
 # ==================================================
 @invoices_bp.route("/upload", methods=["POST"])
 def upload():
-    """Upload + contrôle qualité + classification CNN + insertion MySQL."""
+    """Upload + pipeline complet (OpenCV + CNN + EasyOCR + MySQL)."""
+
     # ===== 1. Vérifier la présence d'un fichier =====
     if "file" not in request.files:
         return jsonify({
@@ -83,14 +97,14 @@ def upload():
             }
         }), 400
 
-    # ===== 4. Sauvegarder =====
+    # ===== 4. Sauvegarder avec un nom unique =====
     original_name = secure_filename(f.filename)
     ext = original_name.rsplit(".", 1)[1].lower() if "." in original_name else ""
     unique_name = f"{uuid.uuid4().hex}.{ext}"
     save_path = os.path.join(UPLOAD_FOLDER, unique_name)
     f.save(save_path)
 
-    # ===== 5. Analyse qualité (OpenCV) =====
+    # ===== 5. Contrôle qualité (OpenCV) =====
     quality_result = None
     quality_error = None
 
@@ -100,6 +114,7 @@ def upload():
         except Exception as e:
             quality_error = str(e)
     else:
+        # PDF : OpenCV ne lit pas directement les PDF
         quality_result = {
             "is_blurry": False, "is_dark": False,
             "is_skewed": False, "is_badly_framed": False,
@@ -111,7 +126,7 @@ def upload():
             "issues": ["PDF_QUALITY_NOT_ANALYZED"],
         }
 
-    # ===== 6. Classification CNN (NOUVEAU) =====
+    # ===== 6. Classification CNN =====
     classification_label = None
     classification_confidence = 0.0
     classification_error = None
@@ -124,43 +139,65 @@ def upload():
         except Exception as e:
             classification_error = str(e)
     else:
-        # PDF : le CNN ne lit pas les PDF directement
-        classification_label = None
         classification_error = "PDF_CLASSIFICATION_NOT_SUPPORTED"
 
-    # ===== 7. Construire les warnings =====
+    # ===== 7. Extraction OCR (EasyOCR) =====
+    ocr_result = None
+    ocr_error = None
+
+    if ext in IMAGE_EXTENSIONS:
+        try:
+            ocr_result = extract_ocr_fields(save_path)
+        except Exception as e:
+            ocr_error = str(e)
+
+    # ===== 8. Construire les warnings =====
     warnings = []
+
+    # Qualité
     if quality_result:
         warnings.extend(quality_result.get("issues", []))
     if quality_error:
-        warnings.append(f"QUALITY_ANALYSIS_FAILED: {quality_error}")
+        warnings.append(f"QUALITY_ANALYSIS_FAILED:{quality_error}")
+
+    # Classification
     if classification_error:
-        warnings.append(f"CLASSIFICATION_FAILED: {classification_error}")
+        warnings.append(f"CLASSIFICATION_FAILED:{classification_error}")
+    if classification_label is not None and classification_confidence < 0.6:
+        warnings.append("LOW_CONFIDENCE")
 
-    # Warnings spécifiques à la classification
-    if classification_label is not None:
-        if classification_confidence < 0.6:
-            warnings.append("LOW_CONFIDENCE")
+    # OCR
+    if ocr_error:
+        warnings.append(f"OCR_FAILED:{ocr_error}")
+    if ocr_result:
+        for field in ["supplier", "invoice_number", "date", "total_ht", "vat", "total_ttc"]:
+            if ocr_result.get(field) is None:
+                warnings.append(f"MISSING_FIELD:{field}")
 
-    # Tant que l'OCR n'est pas branché, on ajoute ce warning
-    warnings.append("OCR_NOT_CONNECTED")
+        # Vérifier cohérence HT + TVA = TTC
+        ht = ocr_result.get("total_ht")
+        vat = ocr_result.get("vat")
+        ttc = ocr_result.get("total_ttc")
+        if all(v is not None for v in [ht, vat, ttc]):
+            if abs((ht + vat) - ttc) > AMOUNT_TOLERANCE:
+                warnings.append("AMOUNT_MISMATCH")
 
-    # ===== 8. Insérer dans MySQL =====
+    # ===== 9. Insérer dans MySQL =====
     try:
         facture_id = persistence_service.create_facture(
             nom_fichier=unique_name,
             chemin_fichier=save_path,
         )
 
-        ocr_text = ""
-
+        # Résultat d'analyse
         persistence_service.create_resultat_analyse(
             facture_id=facture_id,
             confiance=classification_confidence,
             qualite=quality_result["quality_status"] if quality_result else "unknown",
-            texte_ocr=ocr_text,
+            texte_ocr=ocr_result.get("raw_text", "") if ocr_result else "",
         )
 
+        # Anomalies / warnings
         for warning in warnings:
             persistence_service.create_anomalie(
                 facture_id=facture_id,
@@ -168,16 +205,26 @@ def upload():
                 description="Avertissement détecté lors du traitement.",
             )
 
-        persistence_service.create_donnee_extraite(facture_id=facture_id)
+        # Données extraites par OCR
+        persistence_service.create_donnee_extraite(
+            facture_id=facture_id,
+            fournisseur=ocr_result.get("supplier") if ocr_result else None,
+            numero_facture=ocr_result.get("invoice_number") if ocr_result else None,
+            date_facture=ocr_result.get("date") if ocr_result else None,
+            montant_ht=ocr_result.get("total_ht") if ocr_result else None,
+            montant_tva=ocr_result.get("vat") if ocr_result else None,
+            montant_ttc=ocr_result.get("total_ttc") if ocr_result else None,
+        )
 
+        # Statut final
         final_status = "warning" if warnings else "processed"
-
         persistence_service.update_facture_status(
             facture_id=facture_id,
             type_document=classification_label or "autre",
             statut=final_status,
         )
 
+        # Récupérer la date d'insertion
         facture_row = persistence_service.get_facture_by_id(facture_id)
         created_at = (
             facture_row["date_importation"].isoformat()
@@ -185,6 +232,7 @@ def upload():
             else None
         )
 
+        # ===== 10. Construire la réponse JSON =====
         return jsonify({
             "id": facture_id,
             "filename": unique_name,
@@ -204,18 +252,23 @@ def upload():
                 },
             },
             "extracted": {
-                "supplier": None, "invoice_number": None, "date": None,
-                "total_ht": None, "vat": None, "total_ttc": None,
+                "supplier": ocr_result.get("supplier") if ocr_result else None,
+                "invoice_number": ocr_result.get("invoice_number") if ocr_result else None,
+                "date": ocr_result.get("date") if ocr_result else None,
+                "total_ht": ocr_result.get("total_ht") if ocr_result else None,
+                "vat": ocr_result.get("vat") if ocr_result else None,
+                "total_ttc": ocr_result.get("total_ttc") if ocr_result else None,
             },
             "validation": {
                 "is_valid": len(warnings) == 0,
                 "warnings": warnings,
             },
-            "ocr_text": ocr_text,
+            "ocr_text": ocr_result.get("raw_text", "") if ocr_result else "",
             "created_at": created_at,
         }), 200
 
     except Exception as e:
+        # Rollback : supprimer le fichier si l'insertion échoue
         try:
             if os.path.exists(save_path):
                 os.remove(save_path)
@@ -232,7 +285,7 @@ def upload():
 
 
 # ==================================================
-# GET /api/invoices — liste
+# GET /api/invoices — liste paginée
 # ==================================================
 @invoices_bp.route("", methods=["GET"])
 def list_invoices():
