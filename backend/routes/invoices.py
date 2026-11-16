@@ -448,3 +448,173 @@ def export_invoice(facture_id: int):
     response = jsonify(data)
     response.headers["Content-Disposition"] = f'attachment; filename="facture_{facture_id}.json"'
     return response, 200
+
+
+# ==================================================
+# PUT /api/invoices/<id> — mise à jour (correction manuelle)
+# ==================================================
+@invoices_bp.route("/<int:facture_id>", methods=["PUT"])
+def update_invoice(facture_id: int):
+    """Met à jour les données extraites d'une facture (correction manuelle)."""
+    if not persistence_service.facture_exists(facture_id):
+        return jsonify({
+            "error": {
+                "code": "NOT_FOUND",
+                "message": f"Aucune facture trouvée avec l'identifiant {facture_id}."
+            }
+        }), 404
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": "Le corps de la requête doit être un JSON valide."
+            }
+        }), 400
+
+    allowed_fields = {"supplier", "invoice_number", "date", "total_ht", "vat", "total_ttc"}
+    provided_fields = set(data.keys()) & allowed_fields
+
+    if not provided_fields:
+        return jsonify({
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": f"Aucun champ valide fourni. Champs autorisés : {sorted(allowed_fields)}"
+            }
+        }), 400
+
+    # Valider chaque champ
+    validated = {}
+
+    if "supplier" in data:
+        val = data["supplier"]
+        if val is None:
+            validated["fournisseur"] = None
+        elif isinstance(val, str) and len(val) <= 255:
+            validated["fournisseur"] = val.strip() or None
+        else:
+            return jsonify({
+                "error": {
+                    "code": "INVALID_INPUT",
+                    "message": "'supplier' doit être une chaîne ≤ 255 caractères."
+                }
+            }), 422
+
+    if "invoice_number" in data:
+        val = data["invoice_number"]
+        if val is None:
+            validated["numero_facture"] = None
+        elif isinstance(val, str) and len(val) <= 100:
+            validated["numero_facture"] = val.strip() or None
+        else:
+            return jsonify({
+                "error": {
+                    "code": "INVALID_INPUT",
+                    "message": "'invoice_number' doit être une chaîne ≤ 100 caractères."
+                }
+            }), 422
+
+    if "date" in data:
+        val = data["date"]
+        if val is None:
+            validated["date_facture"] = None
+        elif isinstance(val, str):
+            try:
+                from datetime import datetime as _dt
+                _dt.strptime(val, "%Y-%m-%d")
+                validated["date_facture"] = val
+            except ValueError:
+                return jsonify({
+                    "error": {
+                        "code": "INVALID_INPUT",
+                        "message": "'date' doit être au format YYYY-MM-DD.",
+                        "details": f"Valeur reçue : {val}"
+                    }
+                }), 422
+        else:
+            return jsonify({
+                "error": {
+                    "code": "INVALID_INPUT",
+                    "message": "'date' doit être une chaîne au format YYYY-MM-DD."
+                }
+            }), 422
+
+    for field, db_field in [
+        ("total_ht", "montant_ht"),
+        ("vat", "montant_tva"),
+        ("total_ttc", "montant_ttc"),
+    ]:
+        if field in data:
+            val = data[field]
+            if val is None:
+                validated[db_field] = None
+            elif isinstance(val, (int, float)) and val >= 0:
+                validated[db_field] = float(val)
+            else:
+                return jsonify({
+                    "error": {
+                        "code": "INVALID_INPUT",
+                        "message": f"'{field}' doit être un nombre positif."
+                    }
+                }), 422
+
+    try:
+        # Mettre à jour
+        persistence_service.update_donnee_extraite(facture_id=facture_id, **validated)
+
+        # Recalculer les warnings
+        row = persistence_service.get_facture_by_id(facture_id)
+
+        # Supprimer les MISSING_FIELD pour les champs maintenant remplis
+        for field, db_field in [
+            ("supplier", "fournisseur"),
+            ("invoice_number", "numero_facture"),
+            ("date", "date_facture"),
+            ("total_ht", "montant_ht"),
+            ("vat", "montant_tva"),
+            ("total_ttc", "montant_ttc"),
+        ]:
+            if row.get(db_field) is not None:
+                persistence_service.delete_anomalies_by_type(
+                    facture_id, f"MISSING_FIELD:{field}"
+                )
+
+        # Recalculer AMOUNT_MISMATCH
+        ht = row.get("montant_ht")
+        vat = row.get("montant_tva")
+        ttc = row.get("montant_ttc")
+        if all(v is not None for v in [ht, vat, ttc]):
+            if abs((float(ht) + float(vat)) - float(ttc)) > AMOUNT_TOLERANCE:
+                anomalies = persistence_service.get_anomalies_by_facture_id(facture_id)
+                if not any(a["type_anomalie"] == "AMOUNT_MISMATCH" for a in anomalies):
+                    persistence_service.create_anomalie(
+                        facture_id=facture_id,
+                        type_anomalie="AMOUNT_MISMATCH",
+                        description="HT + TVA ≠ TTC (après correction manuelle).",
+                    )
+        else:
+            persistence_service.delete_anomalies_by_type(facture_id, "AMOUNT_MISMATCH")
+
+        # Recalculer le statut
+        anomalies = persistence_service.get_anomalies_by_facture_id(facture_id)
+        has_warnings = len(anomalies) > 0
+        new_status = "warning" if has_warnings else "processed"
+
+        row = persistence_service.get_facture_by_id(facture_id)
+        persistence_service.update_facture_status(
+            facture_id=facture_id,
+            type_document=row["type_document"] or "autre",
+            statut=new_status,
+        )
+
+        return get_invoice(facture_id)
+
+    except Exception as e:
+        return jsonify({
+            "error": {
+                "code": "DB_ERROR",
+                "message": "Impossible de mettre à jour la facture.",
+                "details": str(e),
+            }
+        }), 500

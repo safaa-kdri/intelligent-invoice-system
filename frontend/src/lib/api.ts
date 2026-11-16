@@ -155,3 +155,26 @@ export async function deleteInvoice(id: number): Promise<{ id: number; status: s
 export function downloadInvoice(id: number): void {
   window.open(`${API_BASE_URL}/api/invoices/${id}/export`, "_blank");
 }
+
+
+// ==================== MISE À JOUR ====================
+
+export interface UpdateInvoicePayload {
+  supplier?: string | null;
+  invoice_number?: string | null;
+  date?: string | null;
+  total_ht?: number | null;
+  vat?: number | null;
+  total_ttc?: number | null;
+}
+
+/**
+ * Met à jour les données extraites d'une facture (correction manuelle).
+ */
+export async function updateInvoice(
+  id: number,
+  payload: UpdateInvoicePayload
+): Promise<InvoiceResponse> {
+  const response = await api.put<InvoiceResponse>(`/api/invoices/${id}`, payload);
+  return response.data;
+}
