@@ -1,0 +1,72 @@
+{
+  "pass": 10,
+  "fail": 1,
+  "details": [
+    {
+      "test_id": "T01",
+      "name": "Importer une image valide",
+      "success": true,
+      "message": "HTTP 200, id=26"
+    },
+    {
+      "test_id": "T02",
+      "name": "Importer un fichier non autorisé",
+      "success": true,
+      "message": "HTTP 415 (attendu: 415)"
+    },
+    {
+      "test_id": "T03",
+      "name": "Importer un PDF valide",
+      "success": true,
+      "message": "HTTP 200"
+    },
+    {
+      "test_id": "T04",
+      "name": "Détecter une image floue",
+      "success": true,
+      "message": "Warnings: ['BLURRY_IMAGE', 'OVEREXPOSED_IMAGE', 'BAD_FRAMING', 'MISSING_FIELD:supplier', 'MISSING_FIELD:invoice_number', 'MISSING_FIELD:date', 'MISSING_FIELD:total_ht', 'MISSING_FIELD:vat', 'MISSING_FIELD:total_ttc']"
+    },
+    {
+      "test_id": "T05",
+      "name": "Classifier une facture d'achat",
+      "success": true,
+      "message": "Prédit: facture_achat (attendu: facture_achat)"
+    },
+    {
+      "test_id": "T06",
+      "name": "Classifier une facture de vente",
+      "success": true,
+      "message": "Prédit: facture_vente (attendu: facture_vente)"
+    },
+    {
+      "test_id": "T07",
+      "name": "Classifier un autre document",
+      "success": true,
+      "message": "Prédit: autre (attendu: autre)"
+    },
+    {
+      "test_id": "T08",
+      "name": "Extraire les informations",
+      "success": true,
+      "message": "6/6 champs extraits : ['date', 'invoice_number', 'supplier', 'total_ht', 'total_ttc', 'vat']"
+    },
+    {
+      "test_id": "T09",
+      "name": "Corriger un champ",
+      "success": true,
+      "message": "Fournisseur: Test Supplier SARL"
+    },
+    {
+      "test_id": "T10",
+      "name": "Détecter un doublon potentiel",
+      "success": false,
+      "message": "Warnings: ['OVEREXPOSED_IMAGE', 'BAD_FRAMING', 'INVOICE_TYPE_UNDETERMINED', 'AMOUNT_MISMATCH']"
+    },
+    {
+      "test_id": "T11",
+      "name": "Consulter l'historique",
+      "success": true,
+      "message": "34 factures, 5 retournées"
+    }
+  ]
+}
