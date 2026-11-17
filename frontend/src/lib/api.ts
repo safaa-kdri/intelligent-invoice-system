@@ -1,19 +1,26 @@
 import axios from "axios";
 
-// URL du backend Flask (configurable via .env.local)
 export const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
 
-// Client axios configuré
 export const api = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 60000, // 60 secondes (l'IA peut être lente)
+  timeout: 60000,
 });
 
-// Types conformes au contrat d'API
+// ==================== TYPES ====================
+
 export interface ClassificationResult {
   label: "facture_achat" | "facture_vente" | "autre";
   confidence: number;
+  cnn_label?: "facture_achat" | "facture_vente" | "autre" | null;
+  corrected?: boolean;
+  correction_reason?: string | null;
+  ocr_hint?: "achat" | "vente" | "indetermine";
+  ocr_matches?: {
+    achat: string[];
+    vente: string[];
+  };
 }
 
 export interface QualityResult {
@@ -21,7 +28,7 @@ export interface QualityResult {
   is_dark: boolean;
   is_skewed: boolean;
   is_badly_framed: boolean;
-  quality_status: "good" | "warning" | "bad";
+  quality_status: "good" | "warning" | "bad" | "ok";
   scores: {
     blur_variance: number;
     brightness_mean: number;
@@ -55,6 +62,19 @@ export interface InvoiceResponse {
   created_at: string | null;
 }
 
+export interface InvoiceListResponse {
+  invoices: Array<{
+    id: number;
+    nom_fichier: string;
+    type_document: string | null;
+    statut: string;
+    date_importation: string;
+  }>;
+  total: number;
+  page: number;
+  limit: number;
+}
+
 export interface ApiError {
   error: {
     code: string;
@@ -63,87 +83,110 @@ export interface ApiError {
   };
 }
 
-// Fonction d'upload
-export async function uploadInvoice(file: File): Promise<InvoiceResponse> {
-  const formData = new FormData();
-  formData.append("file", file);
-
-  const response = await api.post<InvoiceResponse>(
-    "/api/invoices/upload",
-    formData,
-    {
-      headers: {
-        "Content-Type": "multipart/form-data",
-      },
-    }
-  );
-
-  return response.data;
+export interface UpdateInvoicePayload {
+  supplier?: string | null;
+  invoice_number?: string | null;
+  date?: string | null;
+  total_ht?: number | null;
+  vat?: number | null;
+  total_ttc?: number | null;
 }
 
-// Fonction de test (health check)
-export async function checkHealth(): Promise<{ status: string }> {
-  const response = await api.get("/api/health");
-  return response.data;
-}
-
-// ==================== TYPES ====================
-
-export interface InvoiceListItem {
-  id: number;
-  nom_fichier: string;
-  type_document: string | null;
-  statut: "processed" | "warning" | "failed" | "pending";
-  date_importation: string;
-}
-
-export interface InvoiceListResponse {
+export interface DashboardStats {
   total: number;
-  page: number;
-  limit: number;
-  invoices: InvoiceListItem[];
+  processed: number;
+  warnings: number;
+  failed: number;
+  by_type: Record<string, number>;
 }
 
-export interface GetInvoicesParams {
+// ==================== VOS FONCTIONS (DESIGN) ====================
+
+export function uploadInvoiceWithProgress(
+  file: File,
+  onProgress?: (percent: number) => void
+): Promise<InvoiceResponse> {
+  return new Promise((resolve, reject) => {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_BASE_URL}/api/invoices/upload`);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText) as InvoiceResponse);
+        } catch {
+          reject(new Error("Réponse serveur invalide (JSON attendu)"));
+        }
+      } else {
+        let msg = `Erreur ${xhr.status}`;
+        try {
+          const body = JSON.parse(xhr.responseText) as ApiError;
+          msg = body?.error?.message ?? msg;
+        } catch { /* ignore */ }
+        reject(new Error(msg));
+      }
+    };
+
+    xhr.onerror = () =>
+      reject(new Error("Erreur réseau. Vérifiez que Flask tourne sur le port 5000."));
+    xhr.ontimeout = () => reject(new Error("Délai dépassé (60 s)."));
+    xhr.send(formData);
+  });
+}
+
+export async function uploadInvoice(file: File): Promise<InvoiceResponse> {
+  return uploadInvoiceWithProgress(file);
+}
+
+// ==================== FONCTIONS DE SAFAA (BACKEND) ====================
+
+export async function getInvoices(params?: {
   page?: number;
   limit?: number;
   status?: "processed" | "warning" | "failed";
   label?: "facture_achat" | "facture_vente" | "autre";
-}
-
-// ==================== FONCTIONS ====================
-
-/**
- * Récupère la liste paginée des factures.
- */
-export async function getInvoices(
-  params: GetInvoicesParams = {}
-): Promise<InvoiceListResponse> {
-  const response = await api.get<InvoiceListResponse>("/api/invoices", {
-    params,
-  });
+}): Promise<InvoiceListResponse> {
+  const response = await api.get<InvoiceListResponse>("/api/invoices", { params });
   return response.data;
 }
 
-/**
- * Récupère le détail d'une facture par son ID.
- */
-export async function getInvoiceById(id: number): Promise<InvoiceResponse> {
+export async function getInvoice(id: number): Promise<InvoiceResponse> {
   const response = await api.get<InvoiceResponse>(`/api/invoices/${id}`);
   return response.data;
 }
 
-/**
- * Supprime une facture.
- */
-export async function deleteInvoice(id: number): Promise<{ id: number; status: string }> {
-  const response = await api.delete(`/api/invoices/${id}`);
+export async function updateInvoice(
+  id: number,
+  payload: UpdateInvoicePayload
+): Promise<InvoiceResponse> {
+  const response = await api.put<InvoiceResponse>(`/api/invoices/${id}`, payload);
   return response.data;
 }
 
-/**
- * Ouvre le téléchargement du JSON d'une facture dans un nouvel onglet.
- */
+export async function deleteInvoice(id: number): Promise<{ id: number; status: string }> {
+  const response = await api.delete<{ id: number; status: string }>(`/api/invoices/${id}`);
+  return response.data;
+}
+
 export function downloadInvoice(id: number): void {
   window.open(`${API_BASE_URL}/api/invoices/${id}/export`, "_blank");
+}
+
+export async function getStats(): Promise<DashboardStats> {
+  const response = await api.get<DashboardStats>("/api/dashboard/stats");
+  return response.data;
+}
+
+export async function checkHealth(): Promise<{ status: string }> {
+  const response = await api.get("/api/health");
+  return response.data;
 }

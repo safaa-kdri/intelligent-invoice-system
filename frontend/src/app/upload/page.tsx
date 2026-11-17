@@ -20,8 +20,11 @@ export default function UploadPage() {
     }
     if (acceptedFiles.length > 0) {
       setFile(acceptedFiles[0]);
-      if (acceptedFiles[0].type.startsWith("image/")) setPreview(URL.createObjectURL(acceptedFiles[0]));
-      else setPreview(null);
+      if (acceptedFiles[0].type.startsWith("image/")) {
+        setPreview(URL.createObjectURL(acceptedFiles[0]));
+      } else {
+        setPreview(null);
+      }
     }
   }, []);
 
@@ -32,12 +35,12 @@ export default function UploadPage() {
     maxFiles: 1,
   });
 
+  // On extrait les props pour les attacher au div natif
   const rootProps = getRootProps();
 
   return (
     <Container maxWidth="md" sx={{ pt: { xs: 12, md: 10 }, pb: 8 }}>
       <Box sx={{ textAlign: "center", mb: 8 }}>
-        {/* CORRECTION 1 : display déplacé dans sx */}
         <Typography variant="overline" color="primary.main" gutterBottom sx={{ display: "block", letterSpacing: "0.2em", fontWeight: 600 }}>
           NOUVELLE ANALYSE
         </Typography>
@@ -50,7 +53,7 @@ export default function UploadPage() {
       </Box>
 
       {!file ? (
-        <div {...rootProps}>
+        <div {...rootProps} style={{ cursor: "pointer" }}>
           <input {...getInputProps()} />
           <Box
             sx={{
@@ -59,14 +62,13 @@ export default function UploadPage() {
               border: "1px solid",
               borderColor: isDragActive ? "primary.main" : "rgba(20, 24, 27, 0.1)",
               bgcolor: isDragActive ? "rgba(15, 76, 63, 0.03)" : "background.paper",
-              borderRadius: 4, 
-              p: { xs: 6, md: 10 }, 
-              textAlign: "center", 
-              cursor: "pointer", 
+              borderRadius: 4,
+              p: { xs: 6, md: 10 },
+              textAlign: "center",
               transition: "all 0.4s ease",
               boxShadow: isDragActive ? "0 20px 40px rgba(15, 76, 63, 0.08)" : "0 10px 30px rgba(0,0,0,0.02)",
-              "&:hover": { 
-                borderColor: "primary.main", 
+              "&:hover": {
+                borderColor: "primary.main",
                 bgcolor: "rgba(15, 76, 63, 0.01)",
                 boxShadow: "0 20px 40px rgba(0,0,0,0.04)",
                 "& .scan-line": { transform: "translateY(200px)", opacity: 1 }
@@ -84,8 +86,7 @@ export default function UploadPage() {
             <Typography variant="body1" color="text.secondary" sx={{ mb: 4 }}>
               ou cliquez pour parcourir vos fichiers
             </Typography>
-            
-            {/* CORRECTION 2 : justifyContent et alignItems déplacés dans sx */}
+
             <Stack direction="row" spacing={2} sx={{ justifyContent: "center", alignItems: "center", color: "text.secondary", fontSize: "0.85rem" }}>
               <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}><CheckCircle2 size={14} /> PDF, JPG, PNG</Box>
               <Typography>•</Typography>
@@ -95,13 +96,11 @@ export default function UploadPage() {
         </div>
       ) : (
         <Card sx={{ p: { xs: 3, md: 6 }, boxShadow: "0 20px 40px rgba(0,0,0,0.04)" }}>
-          {/* CORRECTION 3 : alignItems déplacé dans sx */}
           <Stack direction={{ xs: "column", sm: "row" }} spacing={4} sx={{ alignItems: "center" }}>
             <Box sx={{ width: 180, height: 220, bgcolor: "action.hover", borderRadius: 2, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", border: "1px solid", borderColor: "divider" }}>
               {preview ? <img src={preview} alt="Aperçu" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <FileText size={64} color="#6E726F" strokeWidth={1} />}
             </Box>
             <Box sx={{ flex: 1, textAlign: { xs: "center", sm: "left" } }}>
-              {/* CORRECTION 4 : display déplacé dans sx */}
               <Typography variant="overline" color="primary.main" gutterBottom sx={{ display: "block", letterSpacing: "0.1em" }}>
                 FICHIER PRÊT
               </Typography>

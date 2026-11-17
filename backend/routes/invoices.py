@@ -1,6 +1,15 @@
 """
 Routes pour la gestion des factures.
 Blueprint Flask monté sur /api/invoices
+
+Pipeline complet :
+    1. Upload + validation fichier
+    2. Contrôle qualité (OpenCV)
+    3. Classification (MobileNetV2)
+    4. Extraction OCR (EasyOCR)
+    5. Raffinement métier (business_logic) ← NOUVEAU
+    6. Insertion MySQL
+    7. Réponse JSON
 """
 import os
 import uuid
@@ -10,6 +19,8 @@ from werkzeug.utils import secure_filename
 from services import persistence_service
 from services.quality_service import analyze_quality
 from services.classification_service import predict as classify_image
+from services.ocr_service import extract_fields as extract_ocr_fields
+from services.business_logic_service import refine_classification
 
 
 invoices_bp = Blueprint("invoices", __name__)
@@ -19,6 +30,7 @@ UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.dirname(__file__)), "upload
 ALLOWED_EXTENSIONS = {"pdf", "jpg", "jpeg", "png"}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 Mo
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png"}
+AMOUNT_TOLERANCE = 0.01
 
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -33,7 +45,11 @@ def allowed_file(filename: str) -> bool:
 # ==================================================
 @invoices_bp.route("/upload", methods=["POST"])
 def upload():
-    """Upload + contrôle qualité + classification CNN + insertion MySQL."""
+    """
+    Upload + pipeline complet :
+    OpenCV → CNN → EasyOCR → Logique métier → MySQL
+    """
+
     # ===== 1. Vérifier la présence d'un fichier =====
     if "file" not in request.files:
         return jsonify({
@@ -83,14 +99,14 @@ def upload():
             }
         }), 400
 
-    # ===== 4. Sauvegarder =====
+    # ===== 4. Sauvegarder avec un nom unique =====
     original_name = secure_filename(f.filename)
     ext = original_name.rsplit(".", 1)[1].lower() if "." in original_name else ""
     unique_name = f"{uuid.uuid4().hex}.{ext}"
     save_path = os.path.join(UPLOAD_FOLDER, unique_name)
     f.save(save_path)
 
-    # ===== 5. Analyse qualité (OpenCV) =====
+    # ===== 5. Contrôle qualité (OpenCV) =====
     quality_result = None
     quality_error = None
 
@@ -111,54 +127,90 @@ def upload():
             "issues": ["PDF_QUALITY_NOT_ANALYZED"],
         }
 
-    # ===== 6. Classification CNN (NOUVEAU) =====
-    classification_label = None
-    classification_confidence = 0.0
+    # ===== 6. Classification CNN =====
+    cnn_label = None
+    cnn_confidence = 0.0
     classification_error = None
 
     if ext in IMAGE_EXTENSIONS:
         try:
-            label, conf = classify_image(save_path)
-            classification_label = label
-            classification_confidence = conf
+            cnn_label, cnn_confidence = classify_image(save_path)
         except Exception as e:
             classification_error = str(e)
     else:
-        # PDF : le CNN ne lit pas les PDF directement
-        classification_label = None
         classification_error = "PDF_CLASSIFICATION_NOT_SUPPORTED"
 
-    # ===== 7. Construire les warnings =====
+    # ===== 7. Extraction OCR (EasyOCR) =====
+    ocr_result = None
+    ocr_error = None
+
+    if ext in IMAGE_EXTENSIONS:
+        try:
+            ocr_result = extract_ocr_fields(save_path)
+        except Exception as e:
+            ocr_error = str(e)
+
+    # ===== 8. Raffinement métier (NOUVEAU) =====
+    refined = refine_classification(
+        cnn_label=cnn_label or "autre",
+        cnn_confidence=cnn_confidence,
+        ocr_result=ocr_result,
+    )
+    final_label = refined["final_label"]
+
+    # ===== 9. Construire les warnings =====
     warnings = []
+
+    # Qualité
     if quality_result:
         warnings.extend(quality_result.get("issues", []))
     if quality_error:
-        warnings.append(f"QUALITY_ANALYSIS_FAILED: {quality_error}")
+        warnings.append(f"QUALITY_ANALYSIS_FAILED:{quality_error}")
+
+    # Classification
     if classification_error:
-        warnings.append(f"CLASSIFICATION_FAILED: {classification_error}")
+        warnings.append(f"CLASSIFICATION_FAILED:{classification_error}")
+    if cnn_label is not None and cnn_confidence < 0.6:
+        warnings.append("LOW_CONFIDENCE")
 
-    # Warnings spécifiques à la classification
-    if classification_label is not None:
-        if classification_confidence < 0.6:
-            warnings.append("LOW_CONFIDENCE")
+    # Si l'OCR a corrigé le CNN → warning explicite
+    if refined["corrected"]:
+        warnings.append("CNN_OVERRIDDEN_BY_OCR")
 
-    # Tant que l'OCR n'est pas branché, on ajoute ce warning
-    warnings.append("OCR_NOT_CONNECTED")
+    # Si indéterminé → warning
+    if refined["ocr_hint"]["hint"] == "indetermine" and cnn_label in (
+        "facture_achat", "facture_vente"
+    ):
+        warnings.append("INVOICE_TYPE_UNDETERMINED")
 
-    # ===== 8. Insérer dans MySQL =====
+    # OCR : champs manquants
+    if ocr_error:
+        warnings.append(f"OCR_FAILED:{ocr_error}")
+    if ocr_result:
+        for field in ["supplier", "invoice_number", "date", "total_ht", "vat", "total_ttc"]:
+            if ocr_result.get(field) is None:
+                warnings.append(f"MISSING_FIELD:{field}")
+
+        # Cohérence HT + TVA = TTC
+        ht = ocr_result.get("total_ht")
+        vat = ocr_result.get("vat")
+        ttc = ocr_result.get("total_ttc")
+        if all(v is not None for v in [ht, vat, ttc]):
+            if abs((ht + vat) - ttc) > AMOUNT_TOLERANCE:
+                warnings.append("AMOUNT_MISMATCH")
+
+    # ===== 10. Insérer dans MySQL =====
     try:
         facture_id = persistence_service.create_facture(
             nom_fichier=unique_name,
             chemin_fichier=save_path,
         )
 
-        ocr_text = ""
-
         persistence_service.create_resultat_analyse(
             facture_id=facture_id,
-            confiance=classification_confidence,
+            confiance=cnn_confidence,
             qualite=quality_result["quality_status"] if quality_result else "unknown",
-            texte_ocr=ocr_text,
+            texte_ocr=ocr_result.get("raw_text", "") if ocr_result else "",
         )
 
         for warning in warnings:
@@ -168,13 +220,20 @@ def upload():
                 description="Avertissement détecté lors du traitement.",
             )
 
-        persistence_service.create_donnee_extraite(facture_id=facture_id)
+        persistence_service.create_donnee_extraite(
+            facture_id=facture_id,
+            fournisseur=ocr_result.get("supplier") if ocr_result else None,
+            numero_facture=ocr_result.get("invoice_number") if ocr_result else None,
+            date_facture=ocr_result.get("date") if ocr_result else None,
+            montant_ht=ocr_result.get("total_ht") if ocr_result else None,
+            montant_tva=ocr_result.get("vat") if ocr_result else None,
+            montant_ttc=ocr_result.get("total_ttc") if ocr_result else None,
+        )
 
         final_status = "warning" if warnings else "processed"
-
         persistence_service.update_facture_status(
             facture_id=facture_id,
-            type_document=classification_label or "autre",
+            type_document=final_label,
             statut=final_status,
         )
 
@@ -185,13 +244,22 @@ def upload():
             else None
         )
 
+        # ===== 11. Réponse JSON =====
         return jsonify({
             "id": facture_id,
             "filename": unique_name,
             "status": final_status,
             "classification": {
-                "label": classification_label or "autre",
-                "confidence": classification_confidence,
+                "label": final_label,
+                "confidence": cnn_confidence,
+                "cnn_label": cnn_label,
+                "corrected": refined["corrected"],
+                "correction_reason": refined["reason"] if refined["corrected"] else None,
+                "ocr_hint": refined["ocr_hint"]["hint"],
+                "ocr_matches": {
+                    "achat": refined["ocr_hint"]["achat_matches"][:3],
+                    "vente": refined["ocr_hint"]["vente_matches"][:3],
+                },
             },
             "quality": {
                 "is_blurry": quality_result["is_blurry"] if quality_result else False,
@@ -204,14 +272,18 @@ def upload():
                 },
             },
             "extracted": {
-                "supplier": None, "invoice_number": None, "date": None,
-                "total_ht": None, "vat": None, "total_ttc": None,
+                "supplier": ocr_result.get("supplier") if ocr_result else None,
+                "invoice_number": ocr_result.get("invoice_number") if ocr_result else None,
+                "date": ocr_result.get("date") if ocr_result else None,
+                "total_ht": ocr_result.get("total_ht") if ocr_result else None,
+                "vat": ocr_result.get("vat") if ocr_result else None,
+                "total_ttc": ocr_result.get("total_ttc") if ocr_result else None,
             },
             "validation": {
                 "is_valid": len(warnings) == 0,
                 "warnings": warnings,
             },
-            "ocr_text": ocr_text,
+            "ocr_text": ocr_result.get("raw_text", "") if ocr_result else "",
             "created_at": created_at,
         }), 200
 
@@ -232,7 +304,7 @@ def upload():
 
 
 # ==================================================
-# GET /api/invoices — liste
+# GET /api/invoices — liste paginée
 # ==================================================
 @invoices_bp.route("", methods=["GET"])
 def list_invoices():
@@ -376,3 +448,173 @@ def export_invoice(facture_id: int):
     response = jsonify(data)
     response.headers["Content-Disposition"] = f'attachment; filename="facture_{facture_id}.json"'
     return response, 200
+
+
+# ==================================================
+# PUT /api/invoices/<id> — mise à jour (correction manuelle)
+# ==================================================
+@invoices_bp.route("/<int:facture_id>", methods=["PUT"])
+def update_invoice(facture_id: int):
+    """Met à jour les données extraites d'une facture (correction manuelle)."""
+    if not persistence_service.facture_exists(facture_id):
+        return jsonify({
+            "error": {
+                "code": "NOT_FOUND",
+                "message": f"Aucune facture trouvée avec l'identifiant {facture_id}."
+            }
+        }), 404
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": "Le corps de la requête doit être un JSON valide."
+            }
+        }), 400
+
+    allowed_fields = {"supplier", "invoice_number", "date", "total_ht", "vat", "total_ttc"}
+    provided_fields = set(data.keys()) & allowed_fields
+
+    if not provided_fields:
+        return jsonify({
+            "error": {
+                "code": "INVALID_INPUT",
+                "message": f"Aucun champ valide fourni. Champs autorisés : {sorted(allowed_fields)}"
+            }
+        }), 400
+
+    # Valider chaque champ
+    validated = {}
+
+    if "supplier" in data:
+        val = data["supplier"]
+        if val is None:
+            validated["fournisseur"] = None
+        elif isinstance(val, str) and len(val) <= 255:
+            validated["fournisseur"] = val.strip() or None
+        else:
+            return jsonify({
+                "error": {
+                    "code": "INVALID_INPUT",
+                    "message": "'supplier' doit être une chaîne ≤ 255 caractères."
+                }
+            }), 422
+
+    if "invoice_number" in data:
+        val = data["invoice_number"]
+        if val is None:
+            validated["numero_facture"] = None
+        elif isinstance(val, str) and len(val) <= 100:
+            validated["numero_facture"] = val.strip() or None
+        else:
+            return jsonify({
+                "error": {
+                    "code": "INVALID_INPUT",
+                    "message": "'invoice_number' doit être une chaîne ≤ 100 caractères."
+                }
+            }), 422
+
+    if "date" in data:
+        val = data["date"]
+        if val is None:
+            validated["date_facture"] = None
+        elif isinstance(val, str):
+            try:
+                from datetime import datetime as _dt
+                _dt.strptime(val, "%Y-%m-%d")
+                validated["date_facture"] = val
+            except ValueError:
+                return jsonify({
+                    "error": {
+                        "code": "INVALID_INPUT",
+                        "message": "'date' doit être au format YYYY-MM-DD.",
+                        "details": f"Valeur reçue : {val}"
+                    }
+                }), 422
+        else:
+            return jsonify({
+                "error": {
+                    "code": "INVALID_INPUT",
+                    "message": "'date' doit être une chaîne au format YYYY-MM-DD."
+                }
+            }), 422
+
+    for field, db_field in [
+        ("total_ht", "montant_ht"),
+        ("vat", "montant_tva"),
+        ("total_ttc", "montant_ttc"),
+    ]:
+        if field in data:
+            val = data[field]
+            if val is None:
+                validated[db_field] = None
+            elif isinstance(val, (int, float)) and val >= 0:
+                validated[db_field] = float(val)
+            else:
+                return jsonify({
+                    "error": {
+                        "code": "INVALID_INPUT",
+                        "message": f"'{field}' doit être un nombre positif."
+                    }
+                }), 422
+
+    try:
+        # Mettre à jour
+        persistence_service.update_donnee_extraite(facture_id=facture_id, **validated)
+
+        # Recalculer les warnings
+        row = persistence_service.get_facture_by_id(facture_id)
+
+        # Supprimer les MISSING_FIELD pour les champs maintenant remplis
+        for field, db_field in [
+            ("supplier", "fournisseur"),
+            ("invoice_number", "numero_facture"),
+            ("date", "date_facture"),
+            ("total_ht", "montant_ht"),
+            ("vat", "montant_tva"),
+            ("total_ttc", "montant_ttc"),
+        ]:
+            if row.get(db_field) is not None:
+                persistence_service.delete_anomalies_by_type(
+                    facture_id, f"MISSING_FIELD:{field}"
+                )
+
+        # Recalculer AMOUNT_MISMATCH
+        ht = row.get("montant_ht")
+        vat = row.get("montant_tva")
+        ttc = row.get("montant_ttc")
+        if all(v is not None for v in [ht, vat, ttc]):
+            if abs((float(ht) + float(vat)) - float(ttc)) > AMOUNT_TOLERANCE:
+                anomalies = persistence_service.get_anomalies_by_facture_id(facture_id)
+                if not any(a["type_anomalie"] == "AMOUNT_MISMATCH" for a in anomalies):
+                    persistence_service.create_anomalie(
+                        facture_id=facture_id,
+                        type_anomalie="AMOUNT_MISMATCH",
+                        description="HT + TVA ≠ TTC (après correction manuelle).",
+                    )
+        else:
+            persistence_service.delete_anomalies_by_type(facture_id, "AMOUNT_MISMATCH")
+
+        # Recalculer le statut
+        anomalies = persistence_service.get_anomalies_by_facture_id(facture_id)
+        has_warnings = len(anomalies) > 0
+        new_status = "warning" if has_warnings else "processed"
+
+        row = persistence_service.get_facture_by_id(facture_id)
+        persistence_service.update_facture_status(
+            facture_id=facture_id,
+            type_document=row["type_document"] or "autre",
+            statut=new_status,
+        )
+
+        return get_invoice(facture_id)
+
+    except Exception as e:
+        return jsonify({
+            "error": {
+                "code": "DB_ERROR",
+                "message": "Impossible de mettre à jour la facture.",
+                "details": str(e),
+            }
+        }), 500

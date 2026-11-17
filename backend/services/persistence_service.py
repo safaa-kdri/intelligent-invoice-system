@@ -259,3 +259,107 @@ def facture_exists(facture_id: int) -> bool:
     finally:
         cursor.close()
         conn.close()
+
+
+def update_donnee_extraite(
+    facture_id: int,
+    fournisseur: str | None = None,
+    numero_facture: str | None = None,
+    date_facture: str | None = None,
+    montant_ht: float | None = None,
+    montant_tva: float | None = None,
+    montant_ttc: float | None = None,
+) -> bool:
+    """
+    Met à jour les données extraites d'une facture.
+    Ne met à jour QUE les champs non-None (les autres restent inchangés).
+    Retourne True si au moins une ligne a été modifiée.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        updates = []
+        params = []
+
+        if fournisseur is not None:
+            updates.append("fournisseur = %s")
+            params.append(fournisseur)
+        if numero_facture is not None:
+            updates.append("numero_facture = %s")
+            params.append(numero_facture)
+        if date_facture is not None:
+            updates.append("date_facture = %s")
+            params.append(date_facture)
+        if montant_ht is not None:
+            updates.append("montant_ht = %s")
+            params.append(montant_ht)
+        if montant_tva is not None:
+            updates.append("montant_tva = %s")
+            params.append(montant_tva)
+        if montant_ttc is not None:
+            updates.append("montant_ttc = %s")
+            params.append(montant_ttc)
+
+        if not updates:
+            return False
+
+        params.append(facture_id)
+        sql = f"UPDATE donnee_extraite SET {', '.join(updates)} WHERE facture_id = %s;"
+        cursor.execute(sql, params)
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def update_resultat_analyse(
+    facture_id: int,
+    confiance: float | None = None,
+    qualite: str | None = None,
+    texte_ocr: str | None = None,
+) -> bool:
+    """Met à jour le résultat d'analyse d'une facture."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        updates = []
+        params = []
+
+        if confiance is not None:
+            updates.append("confiance = %s")
+            params.append(confiance)
+        if qualite is not None:
+            updates.append("qualite = %s")
+            params.append(qualite)
+        if texte_ocr is not None:
+            updates.append("texte_ocr = %s")
+            params.append(texte_ocr)
+
+        if not updates:
+            return False
+
+        params.append(facture_id)
+        sql = f"UPDATE resultat_analyse SET {', '.join(updates)} WHERE facture_id = %s;"
+        cursor.execute(sql, params)
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def delete_anomalies_by_type(facture_id: int, type_anomalie: str) -> int:
+    """Supprime les anomalies d'un type donné pour une facture."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "DELETE FROM anomalie WHERE facture_id = %s AND type_anomalie = %s;",
+            (facture_id, type_anomalie),
+        )
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        cursor.close()
+        conn.close()
