@@ -27,7 +27,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 # ==================================================
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 16
-EPOCHS = 15
+EPOCHS = 10
 LEARNING_RATE = 1e-3
 FINE_TUNE_AT = 100  # couche à partir de laquelle on fine-tune (sur 154 de MobileNetV2)
 
