@@ -21,6 +21,7 @@ from services.quality_service import analyze_quality
 from services.classification_service import predict as classify_image
 from services.ocr_service import extract_fields as extract_ocr_fields
 from services.business_logic_service import refine_classification
+from services.pdf_service import pdf_to_image
 
 
 invoices_bp = Blueprint("invoices", __name__)
@@ -106,47 +107,50 @@ def upload():
     save_path = os.path.join(UPLOAD_FOLDER, unique_name)
     f.save(save_path)
 
+    # Les modèles travaillent sur des images : rasteriser la première page du PDF.
+    analysis_path = save_path
+    generated_image_path = None
+    pdf_conversion_error = None
+
+    if ext == "pdf":
+        generated_image_path = os.path.join(
+            UPLOAD_FOLDER,
+            f"{uuid.uuid4().hex}.png",
+        )
+        try:
+            analysis_path = pdf_to_image(save_path, generated_image_path)
+        except Exception as e:
+            pdf_conversion_error = str(e)
+            analysis_path = None
+
     # ===== 5. Contrôle qualité (OpenCV) =====
     quality_result = None
     quality_error = None
 
-    if ext in IMAGE_EXTENSIONS:
+    if analysis_path:
         try:
-            quality_result = analyze_quality(save_path)
+            quality_result = analyze_quality(analysis_path)
         except Exception as e:
             quality_error = str(e)
-    else:
-        quality_result = {
-            "is_blurry": False, "is_dark": False,
-            "is_skewed": False, "is_badly_framed": False,
-            "quality_status": "good",
-            "scores": {
-                "blur_variance": 0.0, "brightness_mean": 0.0,
-                "skew_angle": 0.0, "document_area_ratio": 0.0,
-            },
-            "issues": ["PDF_QUALITY_NOT_ANALYZED"],
-        }
 
     # ===== 6. Classification CNN =====
     cnn_label = None
     cnn_confidence = 0.0
     classification_error = None
 
-    if ext in IMAGE_EXTENSIONS:
+    if analysis_path:
         try:
-            cnn_label, cnn_confidence = classify_image(save_path)
+            cnn_label, cnn_confidence = classify_image(analysis_path)
         except Exception as e:
             classification_error = str(e)
-    else:
-        classification_error = "PDF_CLASSIFICATION_NOT_SUPPORTED"
 
     # ===== 7. Extraction OCR (EasyOCR) =====
     ocr_result = None
     ocr_error = None
 
-    if ext in IMAGE_EXTENSIONS:
+    if analysis_path:
         try:
-            ocr_result = extract_ocr_fields(save_path)
+            ocr_result = extract_ocr_fields(analysis_path)
         except Exception as e:
             ocr_error = str(e)
 
@@ -160,6 +164,9 @@ def upload():
 
     # ===== 9. Construire les warnings =====
     warnings = []
+
+    if pdf_conversion_error:
+        warnings.append(f"PDF_CONVERSION_FAILED:{pdf_conversion_error}")
 
     # Qualité
     if quality_result:
@@ -237,6 +244,9 @@ def upload():
             statut=final_status,
         )
 
+        if generated_image_path and os.path.exists(generated_image_path):
+            os.remove(generated_image_path)
+
         facture_row = persistence_service.get_facture_by_id(facture_id)
         created_at = (
             facture_row["date_importation"].isoformat()
@@ -291,6 +301,11 @@ def upload():
         try:
             if os.path.exists(save_path):
                 os.remove(save_path)
+        except Exception:
+            pass
+        try:
+            if generated_image_path and os.path.exists(generated_image_path):
+                os.remove(generated_image_path)
         except Exception:
             pass
 

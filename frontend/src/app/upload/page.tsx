@@ -34,6 +34,7 @@ export default function UploadPage() {
     }
   };
 
+  
   const onDrop = useCallback((acceptedFiles: File[], fileRejections: FileRejection[]) => {
     setError(null);
     if (fileRejections.length > 0) {
