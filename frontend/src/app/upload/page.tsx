@@ -1,16 +1,40 @@
 "use client";
 
-import { Box, Typography, Button, Card, Stack, IconButton, Container } from "@mui/material";
+import { useRouter } from "next/navigation";
+import { Box, Typography, Button, Card, Stack, IconButton, Container, CircularProgress } from "@mui/material";
 import { UploadCloud, FileText, X, CheckCircle2 } from "lucide-react";
 import { useState, useCallback } from "react";
-import { useDropzone } from "react-dropzone";
+import { useDropzone, type FileRejection } from "react-dropzone";
+import { uploadInvoice } from "@/lib/api";
 
 export default function UploadPage() {
+  const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
 
-  const onDrop = useCallback((acceptedFiles: File[], fileRejections: any[]) => {
+  const handleAnalyze = async () => {
+    if (!file || isAnalyzing) return;
+
+    setError(null);
+    setIsAnalyzing(true);
+
+    try {
+      const invoice = await uploadInvoice(file);
+      router.push(`/invoices/${invoice.id}`);
+    } catch (uploadError: unknown) {
+      setError(
+        uploadError instanceof Error
+          ? uploadError.message
+          : "Une erreur inattendue est survenue pendant l'analyse."
+      );
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const onDrop = useCallback((acceptedFiles: File[], fileRejections: FileRejection[]) => {
     setError(null);
     if (fileRejections.length > 0) {
       const rejection = fileRejections[0];
@@ -106,17 +130,25 @@ export default function UploadPage() {
               </Typography>
               <Typography variant="h5" sx={{ fontFamily: "var(--font-playfair)", mb: 1, wordBreak: "break-all" }}>{file.name}</Typography>
               <Typography variant="body2" color="text.secondary" sx={{ mb: 4, fontFamily: "var(--font-plex-mono)" }}>{(file.size / 1024 / 1024).toFixed(2)} Mo</Typography>
-              <Button variant="contained" color="primary" size="large" sx={{ width: { xs: "100%", sm: "auto" }, px: 4, py: 1.5 }}>
-                Lancer l'analyse
+              <Button
+                variant="contained"
+                color="primary"
+                size="large"
+                onClick={handleAnalyze}
+                disabled={isAnalyzing}
+                startIcon={isAnalyzing ? <CircularProgress size={18} color="inherit" /> : undefined}
+                sx={{ width: { xs: "100%", sm: "auto" }, px: 4, py: 1.5 }}
+              >
+                {isAnalyzing ? "Analyse en cours..." : "Lancer l'analyse"}
               </Button>
             </Box>
-            <IconButton onClick={() => { setFile(null); setPreview(null); }} sx={{ color: "error.main", alignSelf: { xs: "center", sm: "flex-start" } }}>
+            <IconButton disabled={isAnalyzing} onClick={() => { setFile(null); setPreview(null); setError(null); }} sx={{ color: "error.main", alignSelf: { xs: "center", sm: "flex-start" } }}>
               <X size={24} />
             </IconButton>
           </Stack>
         </Card>
       )}
-      {error && <Box sx={{ mt: 4, p: 3, bgcolor: "error.main", color: "error.contrastText", borderRadius: 2, textAlign: "center" }}><Typography variant="body2" sx={{ fontWeight: 500 }}>{error}</Typography></Box>}
+      {error && <Box role="alert" sx={{ mt: 4, p: 3, bgcolor: "error.main", color: "error.contrastText", borderRadius: 2, textAlign: "center" }}><Typography variant="body2" sx={{ fontWeight: 500 }}>{error}</Typography></Box>}
     </Container>
   );
 }

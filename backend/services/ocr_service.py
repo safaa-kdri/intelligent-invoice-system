@@ -1,11 +1,17 @@
 """
-Service d'extraction de texte (OCR) avec EasyOCR.
+Service d'extraction de texte (OCR) avec EasyOCR + analyse spatiale.
 
-Fonctions :
-    - extract_text(image_path) : extrait le texte brut de l'image
-    - extract_fields(image_path) : extrait et structure les 6 champs
-                                    (fournisseur, n° facture, date, HT, TVA, TTC)
+Amélioration : utilise les bounding boxes d'EasyOCR pour mieux extraire
+les champs sur les factures à mise en page complexe (colonnes, tableaux).
 
+Stratégie :
+    1. Extraire tous les textes + positions
+    2. Identifier les zones : haut/bas, gauche/droite
+    3. Chercher le fournisseur en haut à droite (zone FROM)
+    4. Chercher le client en haut à gauche (zone TO)
+    5. Chercher les montants dans la partie basse (totaux)
+
+Supporte les factures en français ET en anglais.
 Compatible EasyOCR 1.7.x
 """
 import os
@@ -37,10 +43,19 @@ def _load_reader():
 
 
 # ==================================================
-# EXTRACTION DU TEXTE BRUT
+# EXTRACTION AVEC POSITIONS
 # ==================================================
-def extract_text(image_path: str) -> str:
-    """Extrait le texte brut d'une image avec EasyOCR."""
+def extract_text_with_positions(image_path: str) -> list[dict]:
+    """
+    Extrait tous les textes avec leurs positions.
+
+    Returns:
+        Liste de dicts : [
+            {"text": "BigCo", "x": 450, "y": 50, "conf": 0.95},
+            {"text": "Inc.",  "x": 470, "y": 80, "conf": 0.92},
+            ...
+        ]
+    """
     if not os.path.exists(image_path):
         raise FileNotFoundError(f"Image introuvable : {image_path}")
 
@@ -52,21 +67,59 @@ def extract_text(image_path: str) -> str:
         raise ValueError(f"Erreur EasyOCR : {e}")
 
     if not results:
-        return ""
+        return []
 
-    lines = []
+    items = []
     for item in results:
-        if len(item) >= 2:
-            text = item[1]
-            if text and text.strip():
-                lines.append(text.strip())
+        if len(item) < 2:
+            continue
 
-    return "\n".join(lines)
+        bbox = item[0]  # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+        text = item[1].strip()
+        confidence = item[2] if len(item) >= 3 else 1.0
+
+        if not text:
+            continue
+
+        # Calculer le centre du bounding box
+        x_coords = [p[0] for p in bbox]
+        y_coords = [p[1] for p in bbox]
+        center_x = sum(x_coords) / 4
+        center_y = sum(y_coords) / 4
+
+        items.append({
+            "text": text,
+            "x": center_x,
+            "y": center_y,
+            "x_min": min(x_coords),
+            "x_max": max(x_coords),
+            "y_min": min(y_coords),
+            "y_max": max(y_coords),
+            "conf": confidence,
+        })
+
+    return items
+
+
+def extract_text(image_path: str) -> str:
+    """Extrait le texte brut (pour compatibilité)."""
+    items = extract_text_with_positions(image_path)
+    return "\n".join(item["text"] for item in items)
 
 
 # ==================================================
-# PARSING DES VALEURS
+# UTILITAIRES
 # ==================================================
+def _get_image_size(image_path: str) -> tuple[int, int]:
+    """Retourne (largeur, hauteur) de l'image."""
+    try:
+        from PIL import Image
+        with Image.open(image_path) as img:
+            return img.width, img.height
+    except Exception:
+        return 1000, 1000  # fallback
+
+
 def _parse_amount(text: str) -> float | None:
     """Convertit '1 234,56' ou '1234.56' en float."""
     if not text:
@@ -122,102 +175,190 @@ def _parse_date(text: str) -> str | None:
     return None
 
 
-def _extract_amount_after_label(text: str, labels: list[str]) -> float | None:
-    """
-    Cherche un montant au format XX.XX ou XX,XX après un libellé.
-    Tolère les sauts de ligne et les caractères parasites entre le libellé
-    et le montant (ex: 'Toid HT\n2231.68 MAD').
-    """
-    for label in labels:
-        # Cherche : label, puis jusqu'à 50 caractères quelconques (y compris \n),
-        # puis capture un montant au format X.XX ou X,XX
-        pattern = rf"{label}[\s\S]{{0,50}}?(\d+[.,]\d{{2}})"
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            amount = _parse_amount(match.group(1))
-            if amount is not None:
-                return amount
-    return None
-
-
 # ==================================================
-# EXTRACTION STRUCTURÉE
+# EXTRACTION STRUCTURÉE AVEC POSITIONS
 # ==================================================
 def extract_fields(image_path: str) -> dict:
-    """Extrait et structure les 6 champs d'une facture."""
-    raw_text = extract_text(image_path)
+    """Extrait et structure les 6 champs d'une facture (avec positions)."""
+    items = extract_text_with_positions(image_path)
 
-    if not raw_text:
+    if not items:
         return {
             "supplier": None, "invoice_number": None, "date": None,
             "total_ht": None, "vat": None, "total_ttc": None, "raw_text": "",
         }
 
-    # ===== Fournisseur =====
-    supplier = None
-    match = re.search(
-        r"(?:fournisseur|vendeur|émetteur|emetteur)\s*[:\-]\s*([A-Za-zÀ-ÿ0-9\s\.\-&']+)",
-        raw_text, re.IGNORECASE,
-    )
-    if match:
-        supplier = match.group(1).strip()[:255]
-    else:
-        first_line = raw_text.split("\n")[0].strip()
-        if (
-            first_line
-            and len(first_line) < 60
-            and not re.search(r"\d{3,}", first_line)
-            and len(first_line) > 2
-        ):
-            supplier = first_line
+    img_width, img_height = _get_image_size(image_path)
+    raw_text = "\n".join(item["text"] for item in items)
 
-    # ===== Numéro de facture =====
-    invoice_number = None
-    patterns_num = [
-        r"(?:facture|fact|invoice)\s*(?:n[°o]?|num[eé]ro|#)?\s*[:\-]?\s*([A-Z0-9\-/]{3,30})",
-        r"n[°o]\s*(?:facture|fact)?\s*[:\-]?\s*([A-Z0-9\-/]{3,30})",
-        r"\b(FAC[\-/]?\d{3,10})\b",
-        r"\b(F[AC]T[\-/]?\d{3,10})\b",
-        r"\b(VTE[\-/]?\d{3,10})\b",
-    ]
-    for pat in patterns_num:
-        m = re.search(pat, raw_text, re.IGNORECASE)
-        if m:
-            invoice_number = m.group(1).strip()
+    # ===== DÉFINIR LES ZONES =====
+    # Top 30% = en-tête (fournisseur, client, titre)
+    # Bottom 50% = totaux
+    header_items = [i for i in items if i["y"] < img_height * 0.4]
+    body_items = [i for i in items if i["y"] >= img_height * 0.4]
+    bottom_items = [i for i in items if i["y"] >= img_height * 0.6]
+
+    # ===== FOURNISSEUR =====
+    # Stratégie 1 : chercher après "FROM", "Vendor", "Fournisseur"
+    supplier = None
+    from_index = None
+    for idx, item in enumerate(items):
+        text_upper = item["text"].upper()
+        if text_upper in ("FROM", "FOURNISSEUR", "VENDOR", "SELLER", "SUPPLIER", "ÉMETTEUR", "EMETTEUR"):
+            from_index = idx
             break
 
-    # ===== Date =====
+    if from_index is not None and from_index + 1 < len(items):
+        # Chercher le texte juste après FROM (même ligne ou en dessous)
+        from_item = items[from_index]
+        candidates = []
+        for item in items[from_index + 1:from_index + 5]:
+            # Même zone (à droite du FROM ou en dessous)
+            if item["y"] > from_item["y"] - 10 and item["y"] < from_item["y"] + 100:
+                candidates.append(item)
+        if candidates:
+            # Concaténer les candidats proches
+            supplier = " ".join(c["text"] for c in candidates[:3]).strip()[:255]
+
+    # Stratégie 2 : chercher en haut à droite (zone fournisseur des factures US)
+    if not supplier:
+        right_top = [i for i in header_items if i["x"] > img_width * 0.5]
+        if right_top:
+            # Prendre le premier texte substantiel (pas un mot-clé)
+            for item in right_top:
+                text = item["text"].strip()
+                if (len(text) > 2 
+                    and text.upper() not in ("TO", "FROM", "INVOICE", "NUMBER", "DATE", "CURRENCY")
+                    and not re.match(r"^\d+$", text)):
+                    supplier = text[:255]
+                    break
+
+    # Stratégie 3 : chercher après un mot-clé explicite
+    if not supplier:
+        match = re.search(
+            r"(?:fournisseur|vendeur|émetteur|emetteur)\s*[:\-]\s*([A-Za-zÀ-ÿ0-9\s\.\-&']+)"
+            r"|(?:vendor|seller|supplier)\s*[:\-]\s*([A-Za-z0-9\s\.\-&'\,]+)",
+            raw_text, re.IGNORECASE,
+        )
+        if match:
+            supplier = (match.group(1) or match.group(2) or "").strip()[:255]
+
+    # Fallback : première ligne substantielle en haut à droite
+    if not supplier:
+        first_line = raw_text.split("\n")[0].strip()
+        if (first_line
+            and len(first_line) < 60
+            and not re.search(r"\d{3,}", first_line)
+            and len(first_line) > 2):
+            supplier = first_line
+
+    # ===== NUMÉRO DE FACTURE =====
+    invoice_number = None
+
+    # Stratégie 1 : chercher après "INVOICE NUMBER", "Facture N°", "N°"
+    for idx, item in enumerate(items):
+        text_upper = item["text"].upper().replace(" ", "")
+        if text_upper in ("INVOICENUMBER", "FACTURENUMBER", "INVOICE#", "INVOICENO", "FACTUREN°"):
+            # Chercher le texte proche (même ligne à droite ou juste en dessous)
+            keyword_item = item
+            candidates = []
+            for i in range(idx + 1, min(idx + 5, len(items))):
+                next_item = items[i]
+                # Même ligne (à droite) ou en dessous immédiat
+                if (next_item["x"] > keyword_item["x"] - 20 
+                    and next_item["y"] < keyword_item["y"] + 80):
+                    candidates.append(next_item["text"])
+            if candidates:
+                invoice_number = candidates[0].strip()
+                break
+
+    # Stratégie 2 : regex sur le texte brut
+    if not invoice_number:
+        patterns_num = [
+            r"(?:invoice\s*(?:number|num|n[°o]|#)?)\s*[:\-]?\s*([A-Z0-9\-/]{3,30})",
+            r"(?:facture|fact)\s*(?:n[°o]?|num[eé]ro|#)?\s*[:\-]?\s*([A-Z0-9\-/]{3,30})",
+            r"\b(FAC[\-/]?\s*\d{3,10})\b",
+            r"\b(VTE[\-/]?\s*\d{3,10})\b",
+            r"\b(\d{5,15})\b",  # fallback : nombre pur
+        ]
+        for pat in patterns_num:
+            m = re.search(pat, raw_text, re.IGNORECASE)
+            if m:
+                candidate = m.group(1).strip()
+                if candidate.upper() not in ("CLIENT", "FOURNISSEUR", "PROFORMA", "CUSTOMER", "SUPPLIER", "INVOICE"):
+                    invoice_number = candidate
+                    break
+
+    # ===== DATE =====
     date = None
-    # D'abord chercher explicitement après "date"
-    m = re.search(
-        r"(?:date\s*(?:de\s*)?(?:facture)?)\s*[:\-]?\s*([\d]{1,2}\s*[/\-\.vV]\s*[\d]{1,2}\s*[/\-\.vV]\s*[\d]{4})",
-        raw_text, re.IGNORECASE,
-    )
-    if m:
-        date = _parse_date(m.group(1))
-    # Sinon, première date trouvée dans le texte
+
+    # Chercher après "DATE", "ISSUE DATE", "INVOICE DATE"
+    for idx, item in enumerate(items):
+        text_upper = item["text"].upper()
+        if any(kw in text_upper for kw in ("DATE", "ISSUE")):
+            # Chercher une date proche
+            for i in range(idx + 1, min(idx + 3, len(items))):
+                next_text = items[i]["text"]
+                parsed = _parse_date(next_text)
+                if parsed:
+                    date = parsed
+                    break
+            if date:
+                break
+
+    # Fallback : première date trouvée
     if not date:
         date = _parse_date(raw_text)
 
-    # ===== Montant HT =====
-    # Tolère "Total HT" ou "Toid HT" (erreur OCR courante T→i)
-    total_ht = _extract_amount_after_label(raw_text, [
-        r"total\s*h\.?\s*t\.?",    # Total HT
-        r"to[il]d\s*h\.?\s*t\.?",  # Toid HT (erreur OCR)
-        r"hors\s*taxe[s]?",        # Hors taxes
-    ])
+    # ===== MONTANTS (chercher dans la partie basse) =====
+    def find_amount_in_zone(zone_items, keywords):
+        """Cherche un montant dans une zone après un mot-clé."""
+        for idx, item in enumerate(zone_items):
+            text_upper = item["text"].upper()
+            for kw in keywords:
+                if kw in text_upper:
+                    # Chercher le montant sur la même ligne ou juste après
+                    for i in range(idx, min(idx + 5, len(zone_items))):
+                        candidate = zone_items[i]["text"]
+                        # Extraire un montant
+                        amount_match = re.search(r"(\d+[.,]\d{2})", candidate)
+                        if amount_match:
+                            return _parse_amount(amount_match.group(1))
+        return None
 
-    # ===== TVA =====
-    # Tolère "TVA (20%)" ou "TvA {203)" (erreurs OCR courantes)
-    vat = _extract_amount_after_label(raw_text, [
-        r"t\.?\s*v\.?\s*a\.?",     # TVA (avec points optionnels)
-    ])
+    # HT
+    total_ht = find_amount_in_zone(
+        bottom_items,
+        ["SUBTOTAL", "SOUS-TOTAL", "TOTAL HT", "TOID HT", "HORS TAXE", "NET AMOUNT"]
+    )
 
-    # ===== Montant TTC =====
-    total_ttc = _extract_amount_after_label(raw_text, [
-        r"total\s*t\.?\s*t\.?\s*c\.?",   # Total TTC
-        r"toutes\s*taxes?\s*comprises?", # Toutes taxes comprises
-    ])
+    # TVA
+    vat = find_amount_in_zone(
+        bottom_items,
+        ["TVA", "TAX", "VAT", "SALES TAX"]
+    )
+
+    # TTC
+    total_ttc = find_amount_in_zone(
+        bottom_items,
+        ["TOTAL TTC", "TOTAL USD", "TOTAL AMOUNT", "GRAND TOTAL", "AMOUNT DUE"]
+    )
+
+    # Fallback : chercher partout si pas trouvé
+    if total_ht is None:
+        m = re.search(r"(?:total\s*h\.?t\.?|subtotal|sous[- ]total)[\s\S]{0,50}?(\d+[.,]\d{2})", raw_text, re.IGNORECASE)
+        if m:
+            total_ht = _parse_amount(m.group(1))
+
+    if vat is None:
+        m = re.search(r"(?:tva|tax|vat)[\s\S]{0,30}?(\d+[.,]\d{2})", raw_text, re.IGNORECASE)
+        if m:
+            vat = _parse_amount(m.group(1))
+
+    if total_ttc is None:
+        m = re.search(r"(?:total\s*t\.?t\.?c\.?|total\s*(?:usd|eur)?|grand\s*total)[\s\S]{0,50}?(\d+[.,]\d{2})", raw_text, re.IGNORECASE)
+        if m:
+            total_ttc = _parse_amount(m.group(1))
 
     return {
         "supplier": supplier,
